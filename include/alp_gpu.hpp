@@ -3,33 +3,50 @@
 #include <vector>
 #include <cstddef>
 
+// ================================
+// ALP-GPU 压缩/解压公共接口（头文件）
+// 说明：
+//   - 本头文件仅暴露必要的类型与 API，避免把实现细节泄露到 ODR（链接）边界；
+//   - 与 CPU 版本保持一致的概念：向量(vector)、行组(row group)、两种模式(ALP/ALPrd)；
+//   - CUDA 实现将原始数据划分为多个“数据块”，每个线程处理一个块，实现 GPU 并行加速；
+//   - 压缩元信息（每块的位流偏移、比特数、元素个数）随压缩字节流一起返回。
+// ================================
+
 namespace alp_gpu {
 
 // 压缩模式（与 CPU 版一致）
-enum class CompressionMode : uint8_t { ALP = 0, ALPrd = 1 };
+enum class CompressionMode : std::uint8_t {
+    ALP  = 0,   // 适合“十进制可精确表示”的数据（全局量化成功率高）
+    ALPrd = 1   // 适合“真正的 IEEE 浮点分布”的数据（切割+字典）
+};
 
 // 运行参数
 struct Params {
-    int  vectorSize = 1000;   // 每个向量的长度（与 CPU 常量一致）
-    int  blockSize  = 100000; // 每个数据块的元素数（一个线程处理一个块）
-    bool debug     = true;   // ← 开启后收集每向量的模式与(e,f)
+    int  vectorSize      = 1000;     // 每个向量的长度（与 CPU 常量一致）
+    int  blockSize       = 100000;   // 每个数据块的元素数（一个线程处理一个块）
+    int  threadsPerBlock = 256;      // 每个 CUDA block 启动的线程数
+    bool use_alprd_cutting = true;   // 允许在 ALPrd 中做 bit 切割与字典
+    bool prefer_alprd      = false;  // 数据不明确时优先选 ALPrd
+    bool debug             = false;  // 打印调试信息（会稍微减速）
 };
 
-// 压缩输出（合并后的位流 + per-block 偏移/长度/元素数，便于解压）
+// 压缩结果（位流+每块元信息），用于解压
 struct Compressed {
-    std::vector<uint8_t>  data;        // 合并后的压缩位流（字节对齐）
-    std::vector<uint64_t> offsets;     // 每块 bit 起始位置（bit）
-    std::vector<uint64_t> bit_sizes;   // 每块占用 bit 数（bit）
-    std::vector<uint64_t> elem_counts; // 每块原始元素数（个）——用于解压还原输出定位
-    int  vectorSize = 1000;
+    std::vector<std::uint8_t>  data;        // 压缩后的连续字节流
+    std::vector<std::uint64_t> offsets;     // 每块位流起始 bit 偏移
+    std::vector<std::uint64_t> bit_sizes;   // 每块占用的 bit 数
+    std::vector<std::uint32_t> elem_counts; // 每块包含元素个数
+    int                        vectorSize = 1000;
 
-    // ↓↓↓ 以下仅在 Params.debug=true 时填充（否则为空）
-    std::vector<uint8_t>  dbg_modes;   // 每向量：0=ALP, 1=ALPrd
-    std::vector<uint8_t>  dbg_e;       // 仅 ALP 有效；ALPrd 填 0xFF
-    std::vector<uint8_t>  dbg_f;       // 仅 ALP 有效；ALPrd 填 0xFF
+    inline bool   empty() const { return data.empty(); }
+    inline size_t bytes() const { return data.size(); }
+    inline size_t blocks() const { return offsets.size(); }
+    inline size_t total_elems() const {
+        size_t s = 0; for (auto v : elem_counts) s += v; return s;
+    }
 };
 
-// 核心 API（double / float 都支持）
+// 压缩 / 解压 API（与 C 版保持语义一致；CUDA 内部采用“一个线程处理一个数据块”的并行策略）
 Compressed compress_double(const double* data, size_t n, const Params& p);
 Compressed compress_float (const float*  data, size_t n, const Params& p);
 
