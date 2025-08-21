@@ -1,0 +1,4 @@
+/mnt/d/wwy/ALP_chat/build/CMakeFiles/alp_compare.dir
+/mnt/d/wwy/ALP_chat/build/CMakeFiles/run.dir
+/mnt/d/wwy/ALP_chat/build/CMakeFiles/edit_cache.dir
+/mnt/d/wwy/ALP_chat/build/CMakeFiles/rebuild_cache.dir
