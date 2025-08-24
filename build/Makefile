@@ -57,10 +57,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /mnt/d/wwy/ALP_chat
+CMAKE_SOURCE_DIR = /mnt/e/START/GPU/ALP_GPU
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /mnt/d/wwy/ALP_chat/build
+CMAKE_BINARY_DIR = /mnt/e/START/GPU/ALP_GPU/build
 
 #=============================================================================
 # Targets provided globally by CMake.
@@ -87,9 +87,9 @@ rebuild_cache/fast: rebuild_cache
 
 # The main all target
 all: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/d/wwy/ALP_chat/build/CMakeFiles /mnt/d/wwy/ALP_chat/build//CMakeFiles/progress.marks
+	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles /mnt/e/START/GPU/ALP_GPU/build//CMakeFiles/progress.marks
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 all
-	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/d/wwy/ALP_chat/build/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles 0
 .PHONY : all
 
 # The main clean target
@@ -117,6 +117,19 @@ depend:
 .PHONY : depend
 
 #=============================================================================
+# Target rules for targets named alp_gpu
+
+# Build rule for target.
+alp_gpu: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 alp_gpu
+.PHONY : alp_gpu
+
+# fast build rule for target.
+alp_gpu/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/build
+.PHONY : alp_gpu/fast
+
+#=============================================================================
 # Target rules for targets named alp_compare
 
 # Build rule for target.
@@ -129,66 +142,53 @@ alp_compare/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/build
 .PHONY : alp_compare/fast
 
-#=============================================================================
-# Target rules for targets named run
-
-# Build rule for target.
-run: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 run
-.PHONY : run
-
-# fast build rule for target.
-run/fast:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/run.dir/build.make CMakeFiles/run.dir/build
-.PHONY : run/fast
-
-src/compare_main.o: src/compare_main.cpp.o
-.PHONY : src/compare_main.o
+examples/compare_main.o: examples/compare_main.cpp.o
+.PHONY : examples/compare_main.o
 
 # target to build an object file
-src/compare_main.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/src/compare_main.cpp.o
-.PHONY : src/compare_main.cpp.o
+examples/compare_main.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o
+.PHONY : examples/compare_main.cpp.o
 
-src/compare_main.i: src/compare_main.cpp.i
-.PHONY : src/compare_main.i
+examples/compare_main.i: examples/compare_main.cpp.i
+.PHONY : examples/compare_main.i
 
 # target to preprocess a source file
-src/compare_main.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/src/compare_main.cpp.i
-.PHONY : src/compare_main.cpp.i
+examples/compare_main.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/examples/compare_main.cpp.i
+.PHONY : examples/compare_main.cpp.i
 
-src/compare_main.s: src/compare_main.cpp.s
-.PHONY : src/compare_main.s
+examples/compare_main.s: examples/compare_main.cpp.s
+.PHONY : examples/compare_main.s
 
 # target to generate assembly for a file
-src/compare_main.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/src/compare_main.cpp.s
-.PHONY : src/compare_main.cpp.s
+examples/compare_main.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/examples/compare_main.cpp.s
+.PHONY : examples/compare_main.cpp.s
 
-src/gpu/alp_gpu.o: src/gpu/alp_gpu.cu.o
-.PHONY : src/gpu/alp_gpu.o
+src/alp_gpu.o: src/alp_gpu.cu.o
+.PHONY : src/alp_gpu.o
 
 # target to build an object file
-src/gpu/alp_gpu.cu.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o
-.PHONY : src/gpu/alp_gpu.cu.o
+src/alp_gpu.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/src/alp_gpu.cu.o
+.PHONY : src/alp_gpu.cu.o
 
-src/gpu/alp_gpu.i: src/gpu/alp_gpu.cu.i
-.PHONY : src/gpu/alp_gpu.i
+src/alp_gpu.i: src/alp_gpu.cu.i
+.PHONY : src/alp_gpu.i
 
 # target to preprocess a source file
-src/gpu/alp_gpu.cu.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.i
-.PHONY : src/gpu/alp_gpu.cu.i
+src/alp_gpu.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/src/alp_gpu.cu.i
+.PHONY : src/alp_gpu.cu.i
 
-src/gpu/alp_gpu.s: src/gpu/alp_gpu.cu.s
-.PHONY : src/gpu/alp_gpu.s
+src/alp_gpu.s: src/alp_gpu.cu.s
+.PHONY : src/alp_gpu.s
 
 # target to generate assembly for a file
-src/gpu/alp_gpu.cu.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.s
-.PHONY : src/gpu/alp_gpu.cu.s
+src/alp_gpu.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/src/alp_gpu.cu.s
+.PHONY : src/alp_gpu.cu.s
 
 # Help Target
 help:
@@ -198,14 +198,14 @@ help:
 	@echo "... depend"
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
-	@echo "... run"
 	@echo "... alp_compare"
-	@echo "... src/compare_main.o"
-	@echo "... src/compare_main.i"
-	@echo "... src/compare_main.s"
-	@echo "... src/gpu/alp_gpu.o"
-	@echo "... src/gpu/alp_gpu.i"
-	@echo "... src/gpu/alp_gpu.s"
+	@echo "... alp_gpu"
+	@echo "... examples/compare_main.o"
+	@echo "... examples/compare_main.i"
+	@echo "... examples/compare_main.s"
+	@echo "... src/alp_gpu.o"
+	@echo "... src/alp_gpu.i"
+	@echo "... src/alp_gpu.s"
 .PHONY : help
 
 

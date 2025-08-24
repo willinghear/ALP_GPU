@@ -14,6 +14,35 @@
 
 namespace alp_gpu {
 
+// ============ 添加采样相关配置和结构 ============
+namespace config {
+    static constexpr int VECTOR_SIZE = 1024;
+    static constexpr int ROWGROUP_SIZE = 100 * VECTOR_SIZE;
+    static constexpr int ROWGROUP_VECTOR_SAMPLES = 8;
+    static constexpr int SAMPLES_PER_VECTOR = 32;
+    static constexpr int MAX_K_COMBINATIONS = 5;
+    static constexpr int SAMPLING_EARLY_EXIT_THRESHOLD = 2;
+}
+
+// 阈值定义
+template<typename T> struct Constants {
+    static constexpr int EXCEPTION_SIZE = sizeof(T) == 8 ? 64 : 32;
+    static constexpr int EXCEPTION_POSITION_SIZE = 16;
+    static constexpr int MAX_EXPONENT = 18;
+    static constexpr size_t RD_SIZE_THRESHOLD_LIMIT = 
+        sizeof(T) == 8 ? (48 * config::SAMPLES_PER_VECTOR) : (22 * config::SAMPLES_PER_VECTOR);
+};
+
+// (e,f)组合及其统计信息
+struct EFCombination {
+    uint8_t e, f;
+    int count;       // 出现次数
+    double score;    // 压缩评分
+};
+
+
+
+
 // 压缩模式（与 CPU 版一致）
 enum class CompressionMode : std::uint8_t {
     ALP  = 0,   // 适合“十进制可精确表示”的数据（全局量化成功率高）
@@ -27,7 +56,7 @@ struct Params {
     int  threadsPerBlock = 256;      // 每个 CUDA block 启动的线程数
     bool use_alprd_cutting = true;   // 允许在 ALPrd 中做 bit 切割与字典
     bool prefer_alprd      = false;  // 数据不明确时优先选 ALPrd
-    bool debug             = false;  // 打印调试信息（会稍微减速）
+    bool debug             = true;  // 打印调试信息（会稍微减速）
 };
 
 // 压缩结果（位流+每块元信息），用于解压

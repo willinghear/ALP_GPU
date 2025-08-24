@@ -8,12 +8,12 @@ set(CMAKE_DEPENDS_LANGUAGES
 
 # The set of dependency files which are needed:
 set(CMAKE_DEPENDS_DEPENDENCY_FILES
-  "/mnt/d/wwy/ALP_chat/src/gpu/alp_gpu.cu" "CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o" "gcc" "CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o.d"
-  "/mnt/d/wwy/ALP_chat/src/compare_main.cpp" "CMakeFiles/alp_compare.dir/src/compare_main.cpp.o" "gcc" "CMakeFiles/alp_compare.dir/src/compare_main.cpp.o.d"
+  "/mnt/e/START/GPU/ALP_GPU/examples/compare_main.cpp" "CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o" "gcc" "CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o.d"
   )
 
 # Targets to which this target links.
 set(CMAKE_TARGET_LINKED_INFO_FILES
+  "/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles/alp_gpu.dir/DependInfo.cmake"
   )
 
 # Fortran module output directory.

@@ -53,10 +53,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /mnt/d/wwy/ALP_chat
+CMAKE_SOURCE_DIR = /mnt/e/START/GPU/ALP_GPU
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /mnt/d/wwy/ALP_chat/build
+CMAKE_BINARY_DIR = /mnt/e/START/GPU/ALP_GPU/build
 
 # Include any dependencies generated for this target.
 include CMakeFiles/alp_compare.dir/depend.make
@@ -69,47 +69,33 @@ include CMakeFiles/alp_compare.dir/progress.make
 # Include the compile flags for this target's objects.
 include CMakeFiles/alp_compare.dir/flags.make
 
-CMakeFiles/alp_compare.dir/src/compare_main.cpp.o: CMakeFiles/alp_compare.dir/flags.make
-CMakeFiles/alp_compare.dir/src/compare_main.cpp.o: ../src/compare_main.cpp
-CMakeFiles/alp_compare.dir/src/compare_main.cpp.o: CMakeFiles/alp_compare.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/mnt/d/wwy/ALP_chat/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object CMakeFiles/alp_compare.dir/src/compare_main.cpp.o"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/alp_compare.dir/src/compare_main.cpp.o -MF CMakeFiles/alp_compare.dir/src/compare_main.cpp.o.d -o CMakeFiles/alp_compare.dir/src/compare_main.cpp.o -c /mnt/d/wwy/ALP_chat/src/compare_main.cpp
+CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: CMakeFiles/alp_compare.dir/flags.make
+CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: ../examples/compare_main.cpp
+CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: CMakeFiles/alp_compare.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CXX object CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o -MF CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o.d -o CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o -c /mnt/e/START/GPU/ALP_GPU/examples/compare_main.cpp
 
-CMakeFiles/alp_compare.dir/src/compare_main.cpp.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/alp_compare.dir/src/compare_main.cpp.i"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /mnt/d/wwy/ALP_chat/src/compare_main.cpp > CMakeFiles/alp_compare.dir/src/compare_main.cpp.i
+CMakeFiles/alp_compare.dir/examples/compare_main.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CXX source to CMakeFiles/alp_compare.dir/examples/compare_main.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /mnt/e/START/GPU/ALP_GPU/examples/compare_main.cpp > CMakeFiles/alp_compare.dir/examples/compare_main.cpp.i
 
-CMakeFiles/alp_compare.dir/src/compare_main.cpp.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/alp_compare.dir/src/compare_main.cpp.s"
-	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /mnt/d/wwy/ALP_chat/src/compare_main.cpp -o CMakeFiles/alp_compare.dir/src/compare_main.cpp.s
-
-CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o: CMakeFiles/alp_compare.dir/flags.make
-CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o: ../src/gpu/alp_gpu.cu
-CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o: CMakeFiles/alp_compare.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/mnt/d/wwy/ALP_chat/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CUDA object CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o"
-	/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o -MF CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o.d -x cu -dc /mnt/d/wwy/ALP_chat/src/gpu/alp_gpu.cu -o CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o
-
-CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CUDA source to CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.i"
-	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_PREPROCESSED_SOURCE
-
-CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CUDA source to assembly CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.s"
-	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_ASSEMBLY_SOURCE
+CMakeFiles/alp_compare.dir/examples/compare_main.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CXX source to assembly CMakeFiles/alp_compare.dir/examples/compare_main.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /mnt/e/START/GPU/ALP_GPU/examples/compare_main.cpp -o CMakeFiles/alp_compare.dir/examples/compare_main.cpp.s
 
 # Object files for target alp_compare
 alp_compare_OBJECTS = \
-"CMakeFiles/alp_compare.dir/src/compare_main.cpp.o" \
-"CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o"
+"CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o"
 
 # External object files for target alp_compare
 alp_compare_EXTERNAL_OBJECTS =
 
-CMakeFiles/alp_compare.dir/cmake_device_link.o: CMakeFiles/alp_compare.dir/src/compare_main.cpp.o
-CMakeFiles/alp_compare.dir/cmake_device_link.o: CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o
+CMakeFiles/alp_compare.dir/cmake_device_link.o: CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o
 CMakeFiles/alp_compare.dir/cmake_device_link.o: CMakeFiles/alp_compare.dir/build.make
+CMakeFiles/alp_compare.dir/cmake_device_link.o: libalp_gpu.a
+CMakeFiles/alp_compare.dir/cmake_device_link.o: /usr/local/cuda/lib64/libcudart.so
 CMakeFiles/alp_compare.dir/cmake_device_link.o: CMakeFiles/alp_compare.dir/dlink.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/mnt/d/wwy/ALP_chat/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Linking CUDA device code CMakeFiles/alp_compare.dir/cmake_device_link.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking CUDA device code CMakeFiles/alp_compare.dir/cmake_device_link.o"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/alp_compare.dir/dlink.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.
@@ -118,18 +104,18 @@ CMakeFiles/alp_compare.dir/build: CMakeFiles/alp_compare.dir/cmake_device_link.o
 
 # Object files for target alp_compare
 alp_compare_OBJECTS = \
-"CMakeFiles/alp_compare.dir/src/compare_main.cpp.o" \
-"CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o"
+"CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o"
 
 # External object files for target alp_compare
 alp_compare_EXTERNAL_OBJECTS =
 
-alp_compare: CMakeFiles/alp_compare.dir/src/compare_main.cpp.o
-alp_compare: CMakeFiles/alp_compare.dir/src/gpu/alp_gpu.cu.o
+alp_compare: CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o
 alp_compare: CMakeFiles/alp_compare.dir/build.make
+alp_compare: libalp_gpu.a
+alp_compare: /usr/local/cuda/lib64/libcudart.so
 alp_compare: CMakeFiles/alp_compare.dir/cmake_device_link.o
 alp_compare: CMakeFiles/alp_compare.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/mnt/d/wwy/ALP_chat/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Linking CXX executable alp_compare"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Linking CXX executable alp_compare"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/alp_compare.dir/link.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.
@@ -141,6 +127,6 @@ CMakeFiles/alp_compare.dir/clean:
 .PHONY : CMakeFiles/alp_compare.dir/clean
 
 CMakeFiles/alp_compare.dir/depend:
-	cd /mnt/d/wwy/ALP_chat/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /mnt/d/wwy/ALP_chat /mnt/d/wwy/ALP_chat /mnt/d/wwy/ALP_chat/build /mnt/d/wwy/ALP_chat/build /mnt/d/wwy/ALP_chat/build/CMakeFiles/alp_compare.dir/DependInfo.cmake --color=$(COLOR)
+	cd /mnt/e/START/GPU/ALP_GPU/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /mnt/e/START/GPU/ALP_GPU /mnt/e/START/GPU/ALP_GPU /mnt/e/START/GPU/ALP_GPU/build /mnt/e/START/GPU/ALP_GPU/build /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles/alp_compare.dir/DependInfo.cmake --color=$(COLOR)
 .PHONY : CMakeFiles/alp_compare.dir/depend
 

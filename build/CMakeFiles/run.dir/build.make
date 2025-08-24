@@ -53,10 +53,10 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /mnt/d/wwy/ALP_chat
+CMAKE_SOURCE_DIR = /mnt/e/START/GPU/ALP_GPU
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /mnt/d/wwy/ALP_chat/build
+CMAKE_BINARY_DIR = /mnt/e/START/GPU/ALP_GPU/build
 
 # Utility rule file for run.
 
@@ -67,8 +67,8 @@ include CMakeFiles/run.dir/compiler_depend.make
 include CMakeFiles/run.dir/progress.make
 
 CMakeFiles/run: alp_compare
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --blue --bold --progress-dir=/mnt/d/wwy/ALP_chat/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Running alp_compare"
-	/mnt/d/wwy/ALP_chat/build/alp_compare
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --blue --bold --progress-dir=/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Running alp_compare"
+	/mnt/e/START/GPU/ALP_GPU/build/alp_compare
 
 run: CMakeFiles/run
 run: CMakeFiles/run.dir/build.make
@@ -83,6 +83,6 @@ CMakeFiles/run.dir/clean:
 .PHONY : CMakeFiles/run.dir/clean
 
 CMakeFiles/run.dir/depend:
-	cd /mnt/d/wwy/ALP_chat/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /mnt/d/wwy/ALP_chat /mnt/d/wwy/ALP_chat /mnt/d/wwy/ALP_chat/build /mnt/d/wwy/ALP_chat/build /mnt/d/wwy/ALP_chat/build/CMakeFiles/run.dir/DependInfo.cmake --color=$(COLOR)
+	cd /mnt/e/START/GPU/ALP_GPU/build && $(CMAKE_COMMAND) -E cmake_depends "Unix Makefiles" /mnt/e/START/GPU/ALP_GPU /mnt/e/START/GPU/ALP_GPU /mnt/e/START/GPU/ALP_GPU/build /mnt/e/START/GPU/ALP_GPU/build /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles/run.dir/DependInfo.cmake --color=$(COLOR)
 .PHONY : CMakeFiles/run.dir/depend
 

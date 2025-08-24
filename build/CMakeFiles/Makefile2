@@ -54,15 +54,16 @@ RM = /usr/bin/cmake -E rm -f
 EQUALS = =
 
 # The top-level source directory on which CMake was run.
-CMAKE_SOURCE_DIR = /mnt/d/wwy/ALP_chat
+CMAKE_SOURCE_DIR = /mnt/e/START/GPU/ALP_GPU
 
 # The top-level build directory on which CMake was run.
-CMAKE_BINARY_DIR = /mnt/d/wwy/ALP_chat/build
+CMAKE_BINARY_DIR = /mnt/e/START/GPU/ALP_GPU/build
 
 #=============================================================================
 # Directory level rules for the build root directory
 
 # The main recursive "all" target.
+all: CMakeFiles/alp_gpu.dir/all
 all: CMakeFiles/alp_compare.dir/all
 .PHONY : all
 
@@ -71,25 +72,51 @@ preinstall:
 .PHONY : preinstall
 
 # The main recursive "clean" target.
+clean: CMakeFiles/alp_gpu.dir/clean
 clean: CMakeFiles/alp_compare.dir/clean
-clean: CMakeFiles/run.dir/clean
 .PHONY : clean
+
+#=============================================================================
+# Target rules for target CMakeFiles/alp_gpu.dir
+
+# All Build rule for target.
+CMakeFiles/alp_gpu.dir/all:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/depend
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/build
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles --progress-num=4,5 "Built target alp_gpu"
+.PHONY : CMakeFiles/alp_gpu.dir/all
+
+# Build rule for subdir invocation for target.
+CMakeFiles/alp_gpu.dir/rule: cmake_check_build_system
+	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles 2
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/alp_gpu.dir/all
+	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles 0
+.PHONY : CMakeFiles/alp_gpu.dir/rule
+
+# Convenience name for target.
+alp_gpu: CMakeFiles/alp_gpu.dir/rule
+.PHONY : alp_gpu
+
+# clean rule for target.
+CMakeFiles/alp_gpu.dir/clean:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/clean
+.PHONY : CMakeFiles/alp_gpu.dir/clean
 
 #=============================================================================
 # Target rules for target CMakeFiles/alp_compare.dir
 
 # All Build rule for target.
-CMakeFiles/alp_compare.dir/all:
+CMakeFiles/alp_compare.dir/all: CMakeFiles/alp_gpu.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/mnt/d/wwy/ALP_chat/build/CMakeFiles --progress-num=1,2,3,4 "Built target alp_compare"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles --progress-num=1,2,3 "Built target alp_compare"
 .PHONY : CMakeFiles/alp_compare.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/alp_compare.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/d/wwy/ALP_chat/build/CMakeFiles 4
+	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles 5
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/alp_compare.dir/all
-	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/d/wwy/ALP_chat/build/CMakeFiles 0
+	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles 0
 .PHONY : CMakeFiles/alp_compare.dir/rule
 
 # Convenience name for target.
@@ -100,32 +127,6 @@ alp_compare: CMakeFiles/alp_compare.dir/rule
 CMakeFiles/alp_compare.dir/clean:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/clean
 .PHONY : CMakeFiles/alp_compare.dir/clean
-
-#=============================================================================
-# Target rules for target CMakeFiles/run.dir
-
-# All Build rule for target.
-CMakeFiles/run.dir/all: CMakeFiles/alp_compare.dir/all
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/run.dir/build.make CMakeFiles/run.dir/depend
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/run.dir/build.make CMakeFiles/run.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/mnt/d/wwy/ALP_chat/build/CMakeFiles --progress-num=5 "Built target run"
-.PHONY : CMakeFiles/run.dir/all
-
-# Build rule for subdir invocation for target.
-CMakeFiles/run.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/d/wwy/ALP_chat/build/CMakeFiles 5
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/run.dir/all
-	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/d/wwy/ALP_chat/build/CMakeFiles 0
-.PHONY : CMakeFiles/run.dir/rule
-
-# Convenience name for target.
-run: CMakeFiles/run.dir/rule
-.PHONY : run
-
-# clean rule for target.
-CMakeFiles/run.dir/clean:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/run.dir/build.make CMakeFiles/run.dir/clean
-.PHONY : CMakeFiles/run.dir/clean
 
 #=============================================================================
 # Special targets to cleanup operation of make.

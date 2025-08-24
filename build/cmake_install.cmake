@@ -1,4 +1,4 @@
-# Install script for directory: /mnt/d/wwy/ALP_chat
+# Install script for directory: /mnt/e/START/GPU/ALP_GPU
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
@@ -50,5 +50,5 @@ endif()
 
 string(REPLACE ";" "\n" CMAKE_INSTALL_MANIFEST_CONTENT
        "${CMAKE_INSTALL_MANIFEST_FILES}")
-file(WRITE "/mnt/d/wwy/ALP_chat/build/${CMAKE_INSTALL_MANIFEST}"
+file(WRITE "/mnt/e/START/GPU/ALP_GPU/build/${CMAKE_INSTALL_MANIFEST}"
      "${CMAKE_INSTALL_MANIFEST_CONTENT}")

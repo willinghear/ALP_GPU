@@ -1,5 +1,5 @@
 CMakeFiles/alp_compare.dir/src/compare_main.cpp.o: \
- /mnt/d/wwy/ALP_chat/src/compare_main.cpp /usr/include/stdc-predef.h \
+ /mnt/e/START/GPU/ALP_GPU/src/compare_main.cpp /usr/include/stdc-predef.h \
  /usr/include/c++/11/iostream \
  /usr/include/x86_64-linux-gnu/c++/11/bits/c++config.h \
  /usr/include/x86_64-linux-gnu/c++/11/bits/os_defines.h \
@@ -181,7 +181,7 @@ CMakeFiles/alp_compare.dir/src/compare_main.cpp.o: \
  /usr/include/c++/11/pstl/execution_defs.h /usr/include/c++/11/numeric \
  /usr/include/c++/11/bits/stl_numeric.h /usr/include/c++/11/bit \
  /usr/include/c++/11/pstl/glue_numeric_defs.h \
- /mnt/d/wwy/ALP_chat/include/compare_utils.hpp \
+ /mnt/e/START/GPU/ALP_GPU/include/compare_utils.hpp \
  /usr/include/c++/11/fstream /usr/include/c++/11/bits/codecvt.h \
  /usr/include/x86_64-linux-gnu/c++/11/bits/basic_file.h \
  /usr/include/x86_64-linux-gnu/c++/11/bits/c++io.h \
@@ -220,8 +220,8 @@ CMakeFiles/alp_compare.dir/src/compare_main.cpp.o: \
  /usr/include/c++/11/tr1/riemann_zeta.tcc /usr/include/c++/11/random \
  /usr/include/c++/11/bits/random.h \
  /usr/include/x86_64-linux-gnu/c++/11/bits/opt_random.h \
- /usr/include/c++/11/bits/random.tcc /mnt/d/wwy/ALP_chat/include/alp_c.h \
- /usr/include/c++/11/climits \
+ /usr/include/c++/11/bits/random.tcc \
+ /mnt/e/START/GPU/ALP_GPU/include/alp_c.h /usr/include/c++/11/climits \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/limits.h \
  /usr/lib/gcc/x86_64-linux-gnu/11/include/syslimits.h \
  /usr/include/limits.h /usr/include/x86_64-linux-gnu/bits/posix1_lim.h \
@@ -242,4 +242,4 @@ CMakeFiles/alp_compare.dir/src/compare_main.cpp.o: \
  /usr/include/c++/11/pstl/glue_memory_defs.h \
  /usr/include/c++/11/unordered_set \
  /usr/include/c++/11/bits/unordered_set.h \
- /mnt/d/wwy/ALP_chat/include/alp_gpu.hpp /usr/include/c++/11/cstddef
+ /mnt/e/START/GPU/ALP_GPU/include/alp_gpu.hpp /usr/include/c++/11/cstddef

@@ -1,45 +1,57 @@
 cmake_minimum_required(VERSION 3.20)
-project(ALP_Compare LANGUAGES CXX CUDA)
+project(ALP LANGUAGES CXX CUDA)
 
-# ===== 语言标准 =====
+# C++/CUDA 标准
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-# ===== CUDA 架构（RTX 4090 → sm_89）=====
-if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89)
-endif()
-
-# Release 缺省
+# 默认 Release
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# ===== 头文件路径 =====
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
-
-# ===== 源文件 =====
-set(SRC
-  src/compare_main.cpp
-  src/gpu/alp_gpu.cu
-)
-
-add_executable(alp_compare ${SRC})
-set_target_properties(alp_compare PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
-# 避免某些环境下的 nvcc 冗余警告
-if (MSVC)
-  target_compile_definitions(alp_compare PRIVATE _CRT_SECURE_NO_WARNINGS)
-else()
-  target_compile_options(alp_compare PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas -O3 -v>)
+# 可按需修改计算能力（4090：89）
+if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 89)
 endif()
 
-# ===== 运行后便捷命令 =====
-add_custom_target(run
-  COMMAND $<TARGET_FILE:alp_compare>
-  DEPENDS alp_compare
-  WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-  COMMENT "Running alp_compare"
+find_package(CUDAToolkit REQUIRED)
+
+# 头文件路径（对内对外都可见）
+set(ALP_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+# ========= GPU 静态库 =========
+# 修改 src/alp_gpu.cu 为你的真实路径
+add_library(alp_gpu STATIC
+  src/alp_gpu.cu
+)
+
+target_include_directories(alp_gpu
+  PUBLIC
+    $<BUILD_INTERFACE:${ALP_INCLUDE_DIR}>
+    $<INSTALL_INTERFACE:include>
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+target_link_libraries(alp_gpu
+  PUBLIC CUDA::cudart
+)
+
+set_target_properties(alp_gpu PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+  POSITION_INDEPENDENT_CODE ON
+)
+
+add_executable(alp_compare
+  examples/compare_main.cpp
+)
+
+target_include_directories(alp_compare
+  PRIVATE ${ALP_INCLUDE_DIR}
+)
+
+target_link_libraries(alp_compare
+  PRIVATE alp_gpu
 )
