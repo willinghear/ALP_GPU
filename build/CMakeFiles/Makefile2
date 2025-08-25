@@ -83,12 +83,12 @@ clean: CMakeFiles/alp_compare.dir/clean
 CMakeFiles/alp_gpu.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles --progress-num=4,5 "Built target alp_gpu"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles --progress-num=3,4,5 "Built target alp_gpu"
 .PHONY : CMakeFiles/alp_gpu.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/alp_gpu.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles 2
+	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles 3
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 CMakeFiles/alp_gpu.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start /mnt/e/START/GPU/ALP_GPU/build/CMakeFiles 0
 .PHONY : CMakeFiles/alp_gpu.dir/rule
@@ -109,7 +109,7 @@ CMakeFiles/alp_gpu.dir/clean:
 CMakeFiles/alp_compare.dir/all: CMakeFiles/alp_gpu.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles --progress-num=1,2,3 "Built target alp_compare"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --progress-dir=/mnt/e/START/GPU/ALP_GPU/build/CMakeFiles --progress-num=1,2 "Built target alp_compare"
 .PHONY : CMakeFiles/alp_compare.dir/all
 
 # Build rule for subdir invocation for target.

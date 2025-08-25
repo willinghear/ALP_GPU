@@ -166,30 +166,6 @@ examples/compare_main.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_compare.dir/build.make CMakeFiles/alp_compare.dir/examples/compare_main.cpp.s
 .PHONY : examples/compare_main.cpp.s
 
-src/alp_gpu.o: src/alp_gpu.cu.o
-.PHONY : src/alp_gpu.o
-
-# target to build an object file
-src/alp_gpu.cu.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/src/alp_gpu.cu.o
-.PHONY : src/alp_gpu.cu.o
-
-src/alp_gpu.i: src/alp_gpu.cu.i
-.PHONY : src/alp_gpu.i
-
-# target to preprocess a source file
-src/alp_gpu.cu.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/src/alp_gpu.cu.i
-.PHONY : src/alp_gpu.cu.i
-
-src/alp_gpu.s: src/alp_gpu.cu.s
-.PHONY : src/alp_gpu.s
-
-# target to generate assembly for a file
-src/alp_gpu.cu.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/alp_gpu.dir/build.make CMakeFiles/alp_gpu.dir/src/alp_gpu.cu.s
-.PHONY : src/alp_gpu.cu.s
-
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -203,9 +179,6 @@ help:
 	@echo "... examples/compare_main.o"
 	@echo "... examples/compare_main.i"
 	@echo "... examples/compare_main.s"
-	@echo "... src/alp_gpu.o"
-	@echo "... src/alp_gpu.i"
-	@echo "... src/alp_gpu.s"
 .PHONY : help
 
 
