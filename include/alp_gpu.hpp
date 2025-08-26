@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <vector>
 #include <cstddef>
-
+#include <cuda_runtime.h> 
 // ================================
 // ALP-GPU 压缩/解压公共接口（头文件）
 // 说明：
@@ -51,8 +51,8 @@ enum class CompressionMode : std::uint8_t {
 
 // 运行参数
 struct Params {
-    int  vectorSize      = 1000;     // 每个向量的长度（与 CPU 常量一致）
-    int  blockSize       = 100000;   // 每个数据块的元素数（一个线程处理一个块）
+    int  vectorSize      = 1024;     // 每个向量的长度（与 CPU 常量一致）
+    int  blockSize       = 102400;   // 每个数据块的元素数（一个线程处理一个块）
     int  threadsPerBlock = 256;      // 每个 CUDA block 启动的线程数
     bool use_alprd_cutting = true;   // 允许在 ALPrd 中做 bit 切割与字典
     bool prefer_alprd      = false;  // 数据不明确时优先选 ALPrd
@@ -65,7 +65,7 @@ struct Compressed {
     std::vector<std::uint64_t> offsets;     // 每块位流起始 bit 偏移
     std::vector<std::uint64_t> bit_sizes;   // 每块占用的 bit 数
     std::vector<std::uint32_t> elem_counts; // 每块包含元素个数
-    int                        vectorSize = 1000;
+    int                        vectorSize = 1024;
 
     inline bool   empty() const { return data.empty(); }
     inline size_t bytes() const { return data.size(); }
@@ -81,5 +81,43 @@ Compressed compress_float (const float*  data, size_t n, const Params& p);
 
 void decompress_double(const Compressed& c, double* out, size_t n, const Params& p);
 void decompress_float (const Compressed& c, float*  out, size_t n, const Params& p);
+
+
+// 设备端压缩结果（压缩数据保存在GPU上）
+struct CompressedDevice {
+    uint8_t* d_data;                // 设备端压缩数据指针
+    size_t data_size;               // 压缩数据大小（字节）
+    std::vector<uint64_t> offsets;  // 每块位流起始bit偏移（保持在主机端）
+    std::vector<uint64_t> bit_sizes;// 每块占用的bit数
+    std::vector<uint32_t> elem_counts; // 每块包含元素个数
+    int vectorSize;
+    
+    // 析构函数自动释放设备内存
+    ~CompressedDevice() {
+        if(d_data) cudaFree(d_data);
+    }
+    
+    // 移动构造函数
+    CompressedDevice(CompressedDevice&& other) noexcept 
+        : d_data(other.d_data), data_size(other.data_size),
+          offsets(std::move(other.offsets)), bit_sizes(std::move(other.bit_sizes)),
+          elem_counts(std::move(other.elem_counts)), vectorSize(other.vectorSize) {
+        other.d_data = nullptr;
+    }
+    
+    // 默认构造函数
+    CompressedDevice() : d_data(nullptr), data_size(0), vectorSize(1024) {}
+};
+
+// 新的设备端API
+CompressedDevice compress_double_device(const double* d_data, size_t n, const Params& p, cudaStream_t stream = 0);
+CompressedDevice compress_float_device(const float* d_data, size_t n, const Params& p, cudaStream_t stream = 0);
+
+void decompress_double_device(const CompressedDevice& c, double* d_out, size_t n, const Params& p, cudaStream_t stream = 0);
+void decompress_float_device(const CompressedDevice& c, float* d_out, size_t n, const Params& p, cudaStream_t stream = 0);
+
+// 辅助函数：将设备端压缩结果拷贝到主机
+Compressed device_to_host(const CompressedDevice& cd);
+CompressedDevice host_to_device(const Compressed& c);
 
 } // namespace alp_gpu
