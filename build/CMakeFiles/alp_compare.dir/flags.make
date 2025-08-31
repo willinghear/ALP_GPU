@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = 
 
-CXX_INCLUDES = -I/mnt/e/START/GPU/ALP_GPU/include -I/usr/local/cuda/include
+CXX_INCLUDES = -I/mnt/e/START/GPU/ALP_GPU/include -I/mnt/e/START/GPU/ALP_GPU/ALP/include -I/usr/local/cuda/include
 
 CXX_FLAGS = -std=gnu++17
 

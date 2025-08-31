@@ -296,6 +296,8 @@ CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: ../examples/compare_main
   /usr/include/c++/11/bits/unordered_set.h \
   ../include/alp_gpu.hpp \
   /usr/include/c++/11/cstddef \
+  /usr/include/c++/11/cassert \
+  /usr/include/assert.h \
   /usr/local/cuda/include/cuda_runtime.h \
   /usr/local/cuda/include/crt/host_config.h \
   /usr/local/cuda/include/builtin_types.h \
@@ -311,8 +313,48 @@ CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: ../examples/compare_main
   /usr/local/cuda/include/cuda_device_runtime_api.h \
   /usr/local/cuda/include/driver_functions.h \
   /usr/local/cuda/include/vector_functions.h \
-  /usr/local/cuda/include/vector_functions.hpp
+  /usr/local/cuda/include/vector_functions.hpp \
+  ../ALP/include/alp/encoder.hpp \
+  ../ALP/include/alp/config.hpp \
+  ../ALP/include/alp/constants.hpp \
+  ../ALP/include/alp/decoder.hpp \
+  ../ALP/include/alp/common.hpp \
+  ../ALP/include/alp/sampler.hpp \
+  ../ALP/include/alp/constants.hpp \
+  /usr/include/c++/11/cfloat \
+  /usr/lib/gcc/x86_64-linux-gnu/11/include/float.h \
+  /usr/include/c++/11/list \
+  /usr/include/c++/11/bits/stl_list.h \
+  /usr/include/c++/11/bits/list.tcc \
+  /usr/include/c++/11/map \
+  /usr/include/c++/11/bits/stl_tree.h \
+  /usr/include/c++/11/bits/stl_map.h \
+  /usr/include/c++/11/bits/stl_multimap.h \
+  ../ALP/include/alp/rd.hpp \
+  ../ALP/include/alp/common.hpp
 
+
+/usr/include/c++/11/bits/stl_multimap.h:
+
+/usr/include/c++/11/bits/stl_map.h:
+
+/usr/include/c++/11/bits/stl_tree.h:
+
+/usr/include/c++/11/map:
+
+/usr/include/c++/11/bits/list.tcc:
+
+/usr/include/c++/11/list:
+
+/usr/lib/gcc/x86_64-linux-gnu/11/include/float.h:
+
+../ALP/include/alp/sampler.hpp:
+
+../ALP/include/alp/constants.hpp:
+
+../ALP/include/alp/config.hpp:
+
+../ALP/include/alp/encoder.hpp:
 
 /usr/local/cuda/include/vector_functions.h:
 
@@ -333,6 +375,10 @@ CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: ../examples/compare_main
 /usr/local/cuda/include/device_types.h:
 
 /usr/local/cuda/include/crt/host_config.h:
+
+/usr/include/assert.h:
+
+/usr/include/c++/11/cassert:
 
 /usr/include/c++/11/bits/unordered_set.h:
 
@@ -473,6 +519,8 @@ CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: ../examples/compare_main
 /usr/include/c++/11/cctype:
 
 /usr/include/c++/11/unordered_map:
+
+/usr/include/c++/11/cfloat:
 
 /usr/include/x86_64-linux-gnu/bits/stdint-intn.h:
 
@@ -638,6 +686,8 @@ CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: ../examples/compare_main
 
 /usr/include/c++/11/bits/stl_algobase.h:
 
+../ALP/include/alp/common.hpp:
+
 /usr/include/c++/11/bits/nested_exception.h:
 
 /usr/include/x86_64-linux-gnu/bits/types/clock_t.h:
@@ -752,6 +802,8 @@ CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: ../examples/compare_main
 
 /usr/include/wctype.h:
 
+../ALP/include/alp/rd.hpp:
+
 /usr/include/x86_64-linux-gnu/c++/11/bits/ctype_base.h:
 
 /usr/include/x86_64-linux-gnu/bits/types/struct_sched_param.h:
@@ -840,6 +892,8 @@ CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: ../examples/compare_main
 
 /usr/include/string.h:
 
+../ALP/include/alp/decoder.hpp:
+
 /usr/include/limits.h:
 
 /usr/include/c++/11/bits/stl_relops.h:
@@ -927,6 +981,8 @@ CMakeFiles/alp_compare.dir/examples/compare_main.cpp.o: ../examples/compare_main
 /usr/include/c++/11/bits/postypes.h:
 
 /usr/include/x86_64-linux-gnu/bits/mathcalls-narrow.h:
+
+/usr/include/c++/11/bits/stl_list.h:
 
 /usr/include/x86_64-linux-gnu/bits/iscanonical.h:
 

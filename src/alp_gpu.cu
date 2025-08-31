@@ -1,162 +1,1394 @@
 /*
- * ============================================
- *  ALP-GPU 压缩/解压（优化版）
- *  主要优化：
- *    1) 并行化所有kernel，移除强制串行化
- *    2) 两阶段压缩策略：先计算元数据，再并行写入
- *    3) 使用共享内存和高效归约
- *    4) 每个线程独立处理向量，提高GPU利用率
- * ============================================
- */
+    //(1.0/double(D_FRAC_ARR[f]))
+    #include "alp_gpu.hpp"
+
+    using std::uint8_t; using std::uint32_t; using std::uint64_t;
+
+    namespace alp_gpu {
+
+    // 设备兼容的键值对结构，替代std::pair
+    struct EFPair {
+        uint8_t exponent, factor;
+        __device__ EFPair() : exponent(0), factor(0) {}
+        __device__ EFPair(uint8_t e, uint8_t f) : exponent(e), factor(f) {}
+        __device__ bool equals(const EFPair& other) const {
+            return exponent == other.exponent && factor == other.factor;
+        }
+    };
+
+    // 修正后的设备端ALP精确匹配检查
+    template<typename T>
+    __device__ inline bool alp_exact_equal(T v, uint8_t e, uint8_t f)
+    {
+        if constexpr (std::is_same_v<T,double>) {
+            double enc = v * D_EXP_ARR[e] * D_FRAC_ARR[f];
+            long long I = fast_round_double(enc);
+            double dec = double(I) *  D_FACT_ARR[f] * D_FRAC_ARR[e];
+            return dec==v;
+        } else {
+            float enc = v * float(D_EXP_ARR[e]) * float(D_FRAC_ARR[f]);
+            int   I   = __float2int_rn(enc);
+            float dec = float(I) * (D_FACT_ARR[f]) * float(D_FRAC_ARR[e]);
+            return dec==v;
+        }
+    }
+
+    template<typename T>
+    __device__ inline void alp_vector_analyze(const T* v, int n, uint8_t e, uint8_t f,
+                                            short& bitw, long long& FOR,
+                                            int& exc_cnt){
+        long long mn=LLONG_MAX, mx=LLONG_MIN;
+        exc_cnt=0;
+        for(int i=0;i<n;++i){
+            double enc = double(v[i]) * D_EXP_ARR[e] * D_FRAC_ARR[f];
+            long long I = fast_round_double(enc);
+            double dec = double(I) * D_FACT_ARR[f] * D_FRAC_ARR[e];
+            if (dec==double(v[i])) { 
+                mn=(mn<I?mn:I); 
+                mx=(mx>I?mx:I); 
+            } else {
+                ++exc_cnt;
+            }
+        }
+        unsigned long long range = (mn==LLONG_MAX)? 0ULL : (unsigned long long)(mx - mn);
+        bitw = (short)width_needed_unsigned(range);
+        FOR  = (mn==LLONG_MAX?0:mn);
+    }
+
+    // 添加缺失的函数定义
+    template<typename T>
+    __device__ inline void alp_vector_choose_best_bits(
+        const T* v, int n,
+        uint8_t& best_e, uint8_t& best_f,
+        short& bitw, long long& FOR, int& exc)
+    {
+        const int val_bits = std::is_same_v<T,double> ? 64 : 32;
+        double best_score = 1e300;
+        best_e=0; best_f=0; bitw=0; FOR=0; exc=0;
+
+        for(int8_t e_idx = Constants<T>::MAX_EXPONENT; e_idx >= 0; --e_idx){
+            for(int8_t f_idx = e_idx; f_idx >= 0; --f_idx){
+                short _bw; long long _FOR; int _exc;
+                alp_vector_analyze<T>(v, n, e_idx, f_idx, _bw, _FOR, _exc);
+                
+                double score = double(n)*_bw + double(_exc)*(val_bits + 16);
+                
+                if (score < best_score){
+                    best_score = score;
+                    best_e = e_idx; 
+                    best_f = f_idx; 
+                    bitw = _bw; 
+                    FOR = _FOR; 
+                    exc = _exc;
+                }
+            }
+        }
+    }
+
+    template<typename T>
+    __device__ inline uint64_t alp_vector_size_bits_safe(int n, uint8_t e, uint8_t f,
+                                                        short bitw, int exc_cnt){
+        const int val_bits = std::is_same_v<T,double> ? 64 : 32;
+        return 145ULL + uint64_t(n) * uint64_t(bitw) + uint64_t(exc_cnt) * (val_bits + 16);
+    }
+
+    template<typename T>
+    __device__ inline bool alp_vector_write_safe(SafeBitWriter& bw, const T* v, int n,
+                                                uint8_t e, uint8_t f, short bitw, long long FOR){
+        assert(n <= MAX_VEC);
+
+        if (!bw.put1(1)) return false; // useALP = 1
+        if (!bw.putN((uint64_t)e, 8)) return false;
+        if (!bw.putN((uint64_t)f, 8)) return false;
+        if (!bw.putN((uint64_t)bitw, 16)) return false;
+        if (!bw.putN((uint64_t)FOR, 64)) return false;
+        if (!bw.putN((uint64_t)n, 32)) return false;
+
+        int exc_cnt=0;
+        int      exc_pos[MAX_VEC];
+        uint64_t exc_val[MAX_VEC];
+
+        for(int i=0;i<n;++i){
+            double enc = double(v[i]) * D_EXP_ARR[e] * D_FRAC_ARR[f];
+            long long I = fast_round_double(enc);
+            double dec = double(I) * D_FACT_ARR[f] * D_FRAC_ARR[e];
+            if (dec==double(v[i])) {
+                uint64_t packed = (uint64_t)(I - FOR);
+                if (!bw.putN(packed, bitw)) return false;
+            } else {
+                if (!bw.putN(0, bitw)) return false;
+                if constexpr (std::is_same_v<T,double>) {
+                    uint64_t raw = *reinterpret_cast<const uint64_t*>(&v[i]);
+                    exc_val[exc_cnt] = raw;
+                } else {
+                    uint32_t raw = *reinterpret_cast<const uint32_t*>(&v[i]);
+                    exc_val[exc_cnt] = raw;
+                }
+                exc_pos[exc_cnt] = i;
+                ++exc_cnt;
+            }
+        }
+        if (!bw.putN((uint64_t)exc_cnt, 16)) return false;
+        for(int k=0;k<exc_cnt;++k){
+            if constexpr (std::is_same_v<T,double>) {
+                if (!bw.putN(exc_val[k], 64)) return false;
+            } else {
+                if (!bw.putN(exc_val[k], 32)) return false;
+            }
+            if (!bw.putN((uint64_t)exc_pos[k], 16)) return false;
+        }
+        return true;
+    }
+
+        template<typename T>
+        __device__ inline void alprd_find_best(const uint64_t* in, int n, ALPrdDict<T>& D){
+            double best_score = 1e100; 
+            int best_rbw = int(sizeof(T)*8) - 1;
+            uint32_t best_dict[DICT_SZ] = {0};
+
+            for(int lbw=1; lbw<=CUT_LIM; ++lbw){
+                int rbw = int(sizeof(T)*8) - lbw;
+                uint32_t lmask = mask_lo(lbw);
+
+                uint32_t uniq_left[MAX_VEC]; 
+                int cnt[MAX_VEC];
+                int u = 0;
+
+                for(int i=0;i<n;++i){
+                    uint32_t left = (uint32_t)((in[i] >> rbw) & lmask);
+                    int j=0; 
+                    for(; j<u; ++j) {
+                        if (uniq_left[j]==left) { 
+                            ++cnt[j]; 
+                            break; 
+                        }
+                    }
+                    if (j==u){ 
+                        uniq_left[u]=left; 
+                        cnt[u]=1; 
+                        ++u; 
+                    }
+                }
+                
+                uint32_t dict[DICT_SZ]={0};
+                int used = (DICT_SZ < u ? DICT_SZ : u);
+                for(int k=0;k<used;++k){
+                    int best_cnt=-1, best_id=-1;
+                    for(int j=0;j<u;++j){
+                        bool taken=false;
+                        for(int t=0;t<k;++t) {
+                            if (dict[t]==uniq_left[j]) { 
+                                taken=true; 
+                                break; 
+                            }
+                        }
+                        if (taken) continue;
+                        if (cnt[j]>best_cnt){ 
+                            best_cnt=cnt[j]; 
+                            best_id=j; 
+                        }
+                    }
+                    if (best_id >= 0) {
+                        dict[k] = uniq_left[best_id];
+                    }
+                }
+                
+                int keep=0;
+                for(int k=0;k<used;++k){
+                    for(int j=0;j<u;++j) {
+                        if (uniq_left[j]==dict[k]) { 
+                            keep += cnt[j]; 
+                            break; 
+                        }
+                    }
+                }
+                int exc = n - keep;
+
+                double bits = 1 + 32 + 8 + double(n)*(DICT_BW + rbw) + 
+                            double(DICT_SZ)*lbw + 16.0*exc + double(lbw)*exc;
+
+                if (bits < best_score){
+                    best_score = bits;
+                    best_rbw   = rbw;
+                    for(int k=0;k<DICT_SZ;++k) best_dict[k]=dict[k];
+                }
+            }
+            D.rightBW = (uint8_t)best_rbw;
+            D.leftBW  = (uint8_t)(int(sizeof(T)*8) - best_rbw);
+            for(int k=0;k<DICT_SZ;++k) D.dict[k]=best_dict[k];
+        }
+
+    template<typename T>
+    __device__ inline uint64_t alprd_vector_size_bits_safe(int n, const ALPrdDict<T>& D, int exc_cnt){
+        uint64_t base = 57ULL + uint64_t(n)*(DICT_BW + D.rightBW) + 
+                        DICT_SZ*D.leftBW + uint64_t(exc_cnt)*(D.leftBW+16);
+        return base;
+    }
+
+    template<typename T>
+    __device__ inline bool alprd_vector_write_safe(SafeBitWriter& bw, const uint64_t* in, int n,
+                                                const ALPrdDict<T>& D){
+        assert(n <= MAX_VEC);
+        
+        if (!bw.put1(0)) return false; // useALP=0
+        if (!bw.putN((uint64_t)n, 32)) return false;
+        if (!bw.putN((uint64_t)D.rightBW, 8)) return false;
+
+        int exc_cnt=0; 
+        uint16_t exc_pos[MAX_VEC]; 
+        uint32_t exc_left[MAX_VEC];
+        uint64_t right_mask = (D.rightBW==64)? ~0ULL : ((1ULL<<D.rightBW)-1ULL);
+        uint32_t left_mask  = mask_lo(D.leftBW);
+
+        for(int i=0;i<n;++i){
+            uint64_t right = in[i] & right_mask;
+            uint32_t left  = (uint32_t)((in[i] >> D.rightBW) & left_mask);
+            short idx = DICT_SZ;
+            for(int k=0;k<DICT_SZ;++k){ 
+                if (D.dict[k]==left){ 
+                    idx=(short)k; 
+                    break; 
+                } 
+            }
+            if (idx<DICT_SZ){
+                if (!bw.putN((uint64_t)idx, DICT_BW)) return false;
+                if (!bw.putN(right, D.rightBW)) return false;
+            }else{
+                if (!bw.putN(0, DICT_BW)) return false;
+                if (!bw.putN(right, D.rightBW)) return false;
+                exc_pos[exc_cnt]  = (uint16_t)i;
+                exc_left[exc_cnt] = left;
+                ++exc_cnt;
+            }
+        }
+        
+        for(int k=0;k<DICT_SZ;++k) {
+            if (!bw.putN((uint64_t)D.dict[k], D.leftBW)) return false;
+        }
+        
+        if (!bw.putN((uint64_t)exc_cnt, 16)) return false;
+        for(int i=0;i<exc_cnt;++i){
+            if (!bw.putN((uint64_t)exc_left[i], D.leftBW)) return false;
+            if (!bw.putN((uint64_t)exc_pos[i], 16)) return false;
+        }
+        return true;
+    }
+
+    // 修正的采样函数，使用设备兼容的数组替代std::map
+    template<typename T>
+    __device__ void rowgroup_sample_and_find_k_combinations(
+        const T* rowgroup_data, 
+        int rowgroup_size,
+        int vectorSize,
+        EFCombination* best_k_combinations,
+        int& k_actual,
+        CompressionMode& mode
+    ) {
+        const int available_alp_vectors = (rowgroup_size + vectorSize - 1) / vectorSize;
+        
+        // 使用设备兼容的数组替代std::map
+        EFPair combinations_keys[19*19];
+        int combinations_values[19*19];
+        int combinations_count = 0;
+        
+        size_t best_estimated_compression_size = Constants<T>::RD_SIZE_THRESHOLD_LIMIT + 1;
+        //选择向量idx
+        for (size_t smp_n = 0; smp_n < config::ROWGROUP_VECTOR_SAMPLES && 
+            smp_n * config::ROWGROUP_SAMPLES_JUMP < available_alp_vectors; smp_n++) {
+            
+            size_t vector_idx = smp_n * config::ROWGROUP_SAMPLES_JUMP;
+            if (vector_idx >= available_alp_vectors) break;
+            
+            size_t vector_start = vector_idx * vectorSize;
+            size_t current_vector_size = (vectorSize < (rowgroup_size - vector_start)) ? 
+                                        vectorSize : (rowgroup_size - vector_start);
+            
+            if (current_vector_size < 2) continue;
+            //没有32个数据就全采样
+            const size_t samples_size = (config::SAMPLES_PER_VECTOR < current_vector_size) ? 
+                                    config::SAMPLES_PER_VECTOR : current_vector_size;
+            const int sample_increments = (current_vector_size + samples_size - 1) / samples_size;
+            
+            T samples[32];
+            for (size_t i = 0; i < samples_size; ++i) {
+                samples[i] = rowgroup_data[vector_start + i * sample_increments];
+            }
+            
+            uint8_t found_exponent = 0;
+            uint8_t found_factor = 0;
+            uint64_t sample_estimated_compression_size = Constants<T>::RD_SIZE_THRESHOLD_LIMIT + 1;
+            
+            for (int8_t exp_ref = Constants<T>::MAX_EXPONENT; exp_ref >= 0; exp_ref--) {
+                for (int8_t factor_idx = exp_ref; factor_idx >= 0; factor_idx--) {
+                    uint16_t exceptions_count = 0;
+                    uint16_t non_exceptions_count = 0;
+                    uint32_t estimated_bits_per_value = 0;
+                    uint64_t estimated_compression_size = 0;
+                    long long max_encoded_value = LLONG_MIN;
+                    long long min_encoded_value = LLONG_MAX;
+                    
+                    for (size_t i = 0; i < samples_size; i++) {
+                        const T actual_value = samples[i];
+                        double enc = actual_value * D_EXP_ARR[exp_ref] * D_FRAC_ARR[factor_idx];
+                        long long encoded_value = fast_round_double(enc);
+                        double decoded_value = double(encoded_value) * D_FACT_ARR[factor_idx] * D_FRAC_ARR[exp_ref];
+                        
+                        if (decoded_value == double(actual_value)) {
+                            non_exceptions_count++;
+                            if (encoded_value > max_encoded_value) max_encoded_value = encoded_value;
+                            if (encoded_value < min_encoded_value) min_encoded_value = encoded_value;
+                        } else {
+                            exceptions_count++;
+                        }
+                    }
+                    
+                    if (non_exceptions_count < 2) continue;
+                    
+                    unsigned long long range = (unsigned long long)(max_encoded_value - min_encoded_value);
+                    estimated_bits_per_value = width_needed_unsigned(range);
+                    estimated_compression_size += samples_size * estimated_bits_per_value;
+                    estimated_compression_size += exceptions_count * (Constants<T>::EXCEPTION_SIZE + Constants<T>::EXCEPTION_POSITION_SIZE);
+                    
+                    if ((estimated_compression_size < sample_estimated_compression_size) ||
+                        (estimated_compression_size == sample_estimated_compression_size && 
+                        found_exponent < exp_ref) ||
+                        ((estimated_compression_size == sample_estimated_compression_size && 
+                        found_exponent == exp_ref) && 
+                        found_factor < factor_idx)) 
+                    {
+                        sample_estimated_compression_size = estimated_compression_size;
+                        found_exponent = exp_ref;
+                        found_factor = factor_idx;
+                        if (sample_estimated_compression_size < best_estimated_compression_size) {
+                            best_estimated_compression_size = sample_estimated_compression_size;
+                        }
+                    }
+                }
+            }
+            
+            // 记录找到的最佳组合，使用设备兼容的方法
+            EFPair key(found_exponent, found_factor);
+            bool found = false;
+            for(int i = 0; i < combinations_count; i++) {
+                if(combinations_keys[i].equals(key)) {
+                    combinations_values[i]++;
+                    found = true;
+                    break;
+                }
+            }
+            if(!found && combinations_count < 19*19) {
+                combinations_keys[combinations_count] = key;
+                combinations_values[combinations_count] = 1;
+                combinations_count++;
+            }
+        }
+        // if(combinations_count!=config::ROWGROUP_VECTOR_SAMPLES)
+        // {
+        //     printf("combinations_count:%d != %d\n",combinations_count,config::ROWGROUP_VECTOR_SAMPLES);
+        // }
+        if (best_estimated_compression_size >= Constants<T>::RD_SIZE_THRESHOLD_LIMIT) {
+            mode = CompressionMode::ALPrd;
+            k_actual = 0;
+            return;
+        }
+        
+        mode = CompressionMode::ALP;
+        
+        // 将组合转换为向量并排序
+        EFCombination all_combinations[19*19];
+        int num_combinations = 0;
+        
+        for(int i = 0; i < combinations_count; i++) {
+            all_combinations[num_combinations].e = combinations_keys[i].exponent;
+            all_combinations[num_combinations].f = combinations_keys[i].factor;
+            all_combinations[num_combinations].count = combinations_values[i];
+            all_combinations[num_combinations].score = 0;
+            num_combinations++;
+        }
+        
+        // 与CPU版本相同的排序逻辑
+        for (int i = 0; i < num_combinations - 1; i++) {
+            for (int j = i + 1; j < num_combinations; j++) {
+                bool should_swap = false;
+                if ((all_combinations[j].count > all_combinations[i].count)||
+                    ((all_combinations[j].count == all_combinations[i].count) && (all_combinations[j].e < all_combinations[i].e))||
+                    ((all_combinations[j].count == all_combinations[i].count) && (all_combinations[j].e == all_combinations[i].e) && (all_combinations[j].f < all_combinations[i].f))) 
+                {
+                    should_swap = true;
+                }
+                
+                if (should_swap) {
+                    EFCombination tmp = all_combinations[i];
+                    all_combinations[i] = all_combinations[j];
+                    all_combinations[j] = tmp;
+                }
+            }
+        }
+        
+        k_actual = (config::MAX_K_COMBINATIONS < num_combinations) ? 
+                config::MAX_K_COMBINATIONS : num_combinations;
+        for (int i = 0; i < k_actual; i++) {
+            best_k_combinations[i] = all_combinations[i];
+        }
+    }
+
+    // 修正的二级采样函数
+    template<typename T>
+    __device__ void vector_choose_from_k_combinations(
+        const T* vec_data,
+        int vec_size,
+        const EFCombination* k_combinations,
+        int k,
+        uint8_t& best_e,
+        uint8_t& best_f,
+        short& bitw,
+        long long& FOR,
+        int& exc
+    ) {
+        if (k == 0) {
+            // 如果没有k组合，使用完整分析
+            alp_vector_choose_best_bits<T>(vec_data, vec_size, best_e, best_f, bitw, FOR, exc);
+            return;
+        }
+        
+        if (k == 1) {
+            best_e = k_combinations[0].e;
+            best_f = k_combinations[0].f;
+            alp_vector_analyze<T>(vec_data, vec_size, best_e, best_f, bitw, FOR, exc);
+            return;
+        }
+        
+        // 二级采样
+        T samples[32];
+        const int sample_count = (config::SAMPLES_PER_VECTOR < vec_size) ? 
+                                config::SAMPLES_PER_VECTOR : vec_size;
+        const int sample_increments = (vec_size + sample_count - 1) / sample_count;
+        
+        for (int i = 0; i < sample_count; i++) {
+            samples[i] = vec_data[i * sample_increments];
+        }
+        
+        double best_score = 1e30;
+        int worse_count = 0;
+        
+        for (int kid = 0; kid < k; kid++) {
+            uint8_t e = k_combinations[kid].e;
+            uint8_t f = k_combinations[kid].f;
+            
+            short test_bitw;
+            long long test_FOR;
+            int test_exc;
+            alp_vector_analyze<T>(samples, sample_count, e, f, test_bitw, test_FOR, test_exc);
+            
+            int val_bits = std::is_same_v<T,double> ? 64 : 32;
+            double score = sample_count * test_bitw + test_exc * (val_bits + 16);
+            
+            if (score < best_score) {
+                best_score = score;
+                best_e = e;
+                best_f = f;
+                worse_count = 0;
+            } else {
+                worse_count++;
+                if (worse_count >= config::SAMPLING_EARLY_EXIT_THRESHOLD) {
+                    break;
+                }
+            }
+        }
+        
+        // 在完整向量上分析最终参数
+        alp_vector_analyze<T>(vec_data, vec_size, best_e, best_f, bitw, FOR, exc);
+    }
+
+    static constexpr int THREADS_PER_BLOCK = 128;
+
+    __global__ void kernel_write_rowgroup_headers(
+        const uint64_t* blk_sizes,
+        const uint64_t* blk_offsets,
+        int numBlocks,
+        int vectorSize,
+        uint8_t* out_bytes
+    ) {
+        int blockId = blockIdx.x * blockDim.x + threadIdx.x;
+        if (blockId >= numBlocks) return;
+        
+        int numVec = (blk_sizes[blockId] + vectorSize - 1) / vectorSize;
+        uint64_t bit_offset = blk_offsets[blockId];
+        
+        SafeBitWriter bw(out_bytes, bit_offset, 8);
+        bw.putN((uint64_t)numVec, 8);
+    }
+
+    // ==================== 第一阶段：采样Kernel ====================
+    template<typename T>
+    __global__ void kernel_rowgroup_sampling(
+        const T* data,
+        const uint64_t* blk_starts,
+        const uint64_t* blk_sizes,
+        int numBlocks,
+        int vectorSize,
+        // 输出每个rowgroup的采样结果
+        uint8_t* out_modes,           // 0=ALP, 1=ALPrd
+        uint8_t* out_k_actual,        // 每个rowgroup的k组合数量
+        uint8_t* out_k_combinations,  // [numBlocks][5][2] 存储(e,f)组合
+        // ALPrd字典输出（只在需要时使用）
+        uint8_t* out_alprd_right_bw,
+        uint8_t* out_alprd_left_bw,
+        uint32_t* out_alprd_dicts     // [numBlocks][8] 字典
+    ) {
+        int blockId = blockIdx.x;
+        if (blockId >= numBlocks) return;
+        
+        const T* blk = data + blk_starts[blockId];
+        int n = (int)blk_sizes[blockId];
+        
+        // 每个block用一个线程完成采样（避免线程间通信复杂性）
+        if (threadIdx.x == 0) {
+            EFCombination k_combinations[5];
+            int k_actual;
+            CompressionMode mode;
+            
+            // 核心采样逻辑（只执行一次）
+            rowgroup_sample_and_find_k_combinations<T>(
+                blk, n, vectorSize, k_combinations, k_actual, mode
+            );
+            
+            // 保存采样结果
+            out_modes[blockId] = (mode == CompressionMode::ALPrd) ? 1 : 0;
+            out_k_actual[blockId] = k_actual;
+            
+            if (mode == CompressionMode::ALP) {
+                // 保存ALP的k组合
+                for(int i = 0; i < k_actual; i++) {
+                    int base_idx = blockId * 5 * 2 + i * 2;
+                    out_k_combinations[base_idx] = k_combinations[i].e;
+                    out_k_combinations[base_idx + 1] = k_combinations[i].f;
+                }
+            } else {
+                // ALPrd模式：计算和保存字典
+                uint64_t tmp[MAX_VEC];
+                const int samples_to_process = min(n, MAX_VEC);
+                
+                for(int i = 0; i < samples_to_process; i++) {
+                    if constexpr (std::is_same_v<T,double>) 
+                        tmp[i] = *reinterpret_cast<const uint64_t*>(&blk[i]);
+                    else 
+                        tmp[i] = *reinterpret_cast<const uint32_t*>(&blk[i]);
+                }
+                
+                ALPrdDict<T> D;
+                alprd_find_best<T>(tmp, samples_to_process, D);
+                
+                out_alprd_right_bw[blockId] = D.rightBW;
+                out_alprd_left_bw[blockId] = D.leftBW;
+                
+                // 保存字典
+                for(int i = 0; i < DICT_SZ; i++) {
+                    out_alprd_dicts[blockId * DICT_SZ + i] = D.dict[i];
+                }
+            }
+        }
+    }
+
+    // ==================== 第二阶段：向量参数选择和大小计算 ====================
+    template<typename T>
+    __global__ void kernel_vector_parameter_selection(
+        const T* data,
+        const uint64_t* blk_starts,
+        const uint64_t* blk_sizes,
+        const uint8_t* modes,
+        const uint8_t* k_actual,
+        const uint8_t* k_combinations,
+        const uint8_t* alprd_right_bw,
+        const uint8_t* alprd_left_bw,
+        const uint32_t* alprd_dicts,
+        int numBlocks,
+        int vectorSize,
+        uint64_t total_vectors,
+        // 输出每个向量的参数
+        uint8_t* vec_e,
+        uint8_t* vec_f,
+        uint16_t* vec_bitw,
+        int64_t* vec_FOR,
+        uint16_t* vec_exc_cnt,
+        uint64_t* vec_bit_sizes
+    ) {
+        int blockId = blockIdx.x;
+        if (blockId >= numBlocks) return;
+        
+        const T* blk = data + blk_starts[blockId];
+        int n = (int)blk_sizes[blockId];
+        int numVec = (n + vectorSize - 1) / vectorSize;
+        CompressionMode mode = (modes[blockId] == 1) ? CompressionMode::ALPrd : CompressionMode::ALP;
+        
+        // 计算全局向量索引基址
+        uint64_t vec_base = 0;
+        for(int b = 0; b < blockId; b++) {
+            vec_base += (blk_sizes[b] + vectorSize - 1) / vectorSize;
+        }
+        
+        if (mode == CompressionMode::ALP) {
+            // 重建k组合数组
+            EFCombination local_k_combinations[5];
+            int local_k_actual = k_actual[blockId];
+            
+            for(int i = 0; i < local_k_actual; i++) {
+                int base_idx = blockId * 5 * 2 + i * 2;
+                local_k_combinations[i].e = k_combinations[base_idx];
+                local_k_combinations[i].f = k_combinations[base_idx + 1];
+            }
+            
+            // 并行处理每个向量
+            for(int v = threadIdx.x; v < numVec; v += blockDim.x) {
+                uint64_t global_vec_idx = vec_base + v;
+                int beg = v * vectorSize;
+                int rem = n - beg;
+                int len = (vectorSize < rem ? vectorSize : rem);
+                
+                uint8_t e, f;
+                short bitw;
+                long long FOR;
+                int exc;
+                
+                // 对应CPU的 find_best_exponent_factor_from_combinations
+                vector_choose_from_k_combinations<T>(
+                    blk + beg, len,
+                    local_k_combinations, local_k_actual,
+                    e, f, bitw, FOR, exc
+                );
+                
+                // 保存参数
+                vec_e[global_vec_idx] = e;
+                vec_f[global_vec_idx] = f;
+                vec_bitw[global_vec_idx] = bitw;
+                vec_FOR[global_vec_idx] = FOR;
+                vec_exc_cnt[global_vec_idx] = exc;
+                vec_bit_sizes[global_vec_idx] = alp_vector_size_bits_safe<T>(len, e, f, bitw, exc);
+            }
+        } else {
+            // ALPrd模式：使用预计算的字典
+            ALPrdDict<T> D;
+            D.rightBW = alprd_right_bw[blockId];
+            D.leftBW = alprd_left_bw[blockId];
+            for(int i = 0; i < DICT_SZ; i++) {
+                D.dict[i] = alprd_dicts[blockId * DICT_SZ + i];
+            }
+            
+            for(int v = threadIdx.x; v < numVec; v += blockDim.x) {
+                uint64_t global_vec_idx = vec_base + v;
+                int beg = v * vectorSize;
+                int rem = n - beg;
+                int len = (vectorSize < rem ? vectorSize : rem);
+                
+                // 计算异常数量
+                int exc = 0;
+                for(int i = 0; i < len; i++) {
+                    uint64_t raw;
+                    if constexpr (std::is_same_v<T,double>) 
+                        raw = *reinterpret_cast<const uint64_t*>(&blk[beg+i]);
+                    else 
+                        raw = *reinterpret_cast<const uint32_t*>(&blk[beg+i]);
+                    
+                    uint32_t left = (uint32_t)((raw >> D.rightBW) & mask_lo(D.leftBW));
+                    bool inDict = false;
+                    for(int k = 0; k < DICT_SZ; k++) {
+                        if(D.dict[k] == left) {
+                            inDict = true;
+                            break;
+                        }
+                    }
+                    if(!inDict) exc++;
+                }
+                
+                // ALPrd标记
+                vec_e[global_vec_idx] = 0xFF;
+                vec_f[global_vec_idx] = 0xFF;
+                vec_exc_cnt[global_vec_idx] = exc;
+                vec_bit_sizes[global_vec_idx] = alprd_vector_size_bits_safe<T>(len, D, exc);
+            }
+        }
+    }
+
+    // ==================== 第三阶段：压缩数据写入 ====================
+    template<typename T>
+    __global__ void kernel_compress_and_write(
+        const T* data,
+        const uint64_t* blk_starts,
+        const uint64_t* blk_sizes,
+        const uint8_t* modes,
+        const uint8_t* alprd_right_bw,
+        const uint8_t* alprd_left_bw,
+        const uint32_t* alprd_dicts,
+        const uint64_t* vec_bit_offsets,
+        const uint8_t* vec_e,
+        const uint8_t* vec_f,
+        const uint16_t* vec_bitw,
+        const int64_t* vec_FOR,
+        int numBlocks,
+        int vectorSize,
+        uint8_t* out_bytes
+    ) {
+        int blockId = blockIdx.x;
+        if (blockId >= numBlocks) return;
+        
+        const T* blk = data + blk_starts[blockId];
+        int n = (int)blk_sizes[blockId];
+        int numVec = (n + vectorSize - 1) / vectorSize;
+        CompressionMode mode = (modes[blockId] == 1) ? CompressionMode::ALPrd : CompressionMode::ALP;
+        
+        // 计算全局向量索引基址
+        uint64_t vec_base = 0;
+        for(int b = 0; b < blockId; b++) {
+            vec_base += (blk_sizes[b] + vectorSize - 1) / vectorSize;
+        }
+        
+        // 并行写入每个向量
+        for(int v = threadIdx.x; v < numVec; v += blockDim.x) {
+            uint64_t global_vec_idx = vec_base + v;
+            int beg = v * vectorSize;
+            int rem = n - beg;
+            int len = (vectorSize < rem ? vectorSize : rem);
+            
+            uint64_t bit_offset = vec_bit_offsets[global_vec_idx];
+            SafeBitWriter bw(out_bytes, bit_offset, 100000); // 充足的缓冲区
+            
+            if(mode == CompressionMode::ALP) {
+                // ALP压缩写入
+                uint8_t e = vec_e[global_vec_idx];
+                uint8_t f = vec_f[global_vec_idx];
+                short bitw = vec_bitw[global_vec_idx];
+                long long FOR = vec_FOR[global_vec_idx];
+                
+                alp_vector_write_safe<T>(bw, blk + beg, len, e, f, bitw, FOR);
+                
+            } else {
+                // ALPrd压缩写入：使用预计算的字典
+                uint64_t tmp[MAX_VEC];
+                for(int i = 0; i < len; i++) {
+                    if constexpr (std::is_same_v<T,double>) 
+                        tmp[i] = *reinterpret_cast<const uint64_t*>(&blk[beg+i]);
+                    else 
+                        tmp[i] = *reinterpret_cast<const uint32_t*>(&blk[beg+i]);
+                }
+                
+                ALPrdDict<T> D;
+                D.rightBW = alprd_right_bw[blockId];
+                D.leftBW = alprd_left_bw[blockId];
+                for(int i = 0; i < DICT_SZ; i++) {
+                    D.dict[i] = alprd_dicts[blockId * DICT_SZ + i];
+                }
+                
+                alprd_vector_write_safe<T>(bw, tmp, len, D);
+            }
+        }
+    }
+
+    template<typename T>
+    __global__ void kernel_decompress_debug(const uint8_t* bytes,
+                                            const uint64_t* blk_starts_bits,
+                                            const uint64_t* blk_bits,
+                                            const uint64_t* out_starts,
+                                            const int vectorSize,
+                                            T* out_data, 
+                                            int numBlocks) {
+        int blockId = blockIdx.x;
+        if (blockId >= numBlocks) return;
+
+        uint64_t bit_offset = blk_starts_bits[blockId];
+        BitReader br{bytes, bit_offset};
+        
+        int numVec = (int)br.getN(8);
+
+        if (numVec <= 0 || numVec > 10000) {
+            return;
+        }
+
+        uint64_t out_pos = out_starts[blockId];
+        
+        for(int v = 0; v < numVec; v++) {
+            int useALP = br.get1();
+
+            if (useALP) {
+                uint8_t e = (uint8_t)br.getN(8);
+                uint8_t f = (uint8_t)br.getN(8);
+                short bitw = (short)br.getN(16);
+                long long FOR = (long long)br.getN(64);
+                int n = (int)br.getN(32);
+
+                if (n <= 0 || n > MAX_VEC) return;
+
+                for(int k = 0; k < n; k++) {
+                    uint64_t enc = br.getN(bitw);
+                    long long I = FOR + (long long)enc;
+                    double dec = double(I) *  D_FACT_ARR[f] * D_FRAC_ARR[e];
+                    out_data[out_pos + k] = (T)dec;
+                }
+
+                int exc = (int)br.getN(16);
+                for(int t = 0; t < exc; t++) {
+                    uint64_t raw = std::is_same_v<T,double> ? br.getN(64) : br.getN(32);
+                    int pos = (int)br.getN(16);
+                    
+                    if (pos < n) {
+                        if constexpr (std::is_same_v<T,double>) {
+                            double val = *reinterpret_cast<double*>(&raw);
+                            out_data[out_pos + pos] = (T)val;
+                        } else {
+                            uint32_t rv = (uint32_t)raw;
+                            float val = *reinterpret_cast<float*>(&rv);
+                            out_data[out_pos + pos] = (T)val;
+                        }
+                    }
+                }
+                out_pos += n;
+            } else {
+                int n = (int)br.getN(32);
+                if (n <= 0 || n > MAX_VEC) return;
+
+                uint8_t rbw = (uint8_t)br.getN(8);
+                uint64_t right[MAX_VEC]; 
+                uint16_t leftIdx[MAX_VEC];
+                
+                for(int k = 0; k < n; k++) {
+                    leftIdx[k] = (uint16_t)br.getN(DICT_BW);
+                    right[k] = br.getN(rbw);
+                }
+
+                uint8_t lbw = uint8_t(sizeof(T)*8 - rbw);
+                uint64_t dict[DICT_SZ];
+                for(int k = 0; k < DICT_SZ; k++) {
+                    dict[k] = br.getN(lbw);
+                }
+
+                int exc = (int)br.getN(16);
+                uint16_t exc_pos[MAX_VEC]; 
+                uint64_t exc_left[MAX_VEC];
+                for(int t = 0; t < exc; t++) {
+                    exc_left[t] = br.getN(lbw);
+                    exc_pos[t] = (uint16_t)br.getN(16);
+                }
+
+                for(int k = 0; k < n; k++) {
+                    uint64_t left = (leftIdx[k] < DICT_SZ) ? dict[leftIdx[k]] : 0ULL;
+                    uint64_t raw = (left << rbw) | right[k];
+                    
+                    if constexpr (std::is_same_v<T,double>) {
+                        double val = *reinterpret_cast<double*>(&raw);
+                        out_data[out_pos + k] = (T)val;
+                    } else {
+                        uint32_t r32 = (uint32_t)raw;
+                        float val = *reinterpret_cast<float*>(&r32);
+                        out_data[out_pos + k] = (T)val;
+                    }
+                }
+
+                for(int t = 0; t < exc; t++) {
+                    int p = exc_pos[t];
+                    uint64_t raw = (exc_left[t] << rbw) | right[p];
+                    
+                    if (p < n) {
+                        if constexpr (std::is_same_v<T,double>) {
+                            double val = *reinterpret_cast<double*>(&raw);
+                            out_data[out_pos + p] = (T)val;
+                        } else {
+                            uint32_t r32 = (uint32_t)raw;
+                            float val = *reinterpret_cast<float*>(&r32);
+                            out_data[out_pos + p] = (T)val;
+                        }
+                    }
+                }
+                out_pos += n;
+            }
+        }
+    }
+
+    //  ==================== 1.压缩实现 ====================
+    //  核心设备端压缩实现（通用函数）
+
+    template<typename T>
+    static CompressedDevice compress_core_device(const T* d_data, size_t n, const Params& p, cudaStream_t stream) {
+        CompressedDevice c;
+        if (n == 0) { 
+            c.vectorSize = p.vectorSize; 
+            return c; 
+        }
+        
+        const int V = p.vectorSize;
+        const int B = p.blockSize > 0 ? p.blockSize : int(n);
+        const int numBlocks = int((n + B - 1) / B);
+        
+        // 计算块信息
+        uint64_t total_vectors = 0;
+        std::vector<uint64_t> h_starts(numBlocks), h_sizes(numBlocks);
+        size_t pos = 0;
+        for(int i = 0; i < numBlocks; i++) {
+            h_starts[i] = pos;
+            uint64_t sz = std::min<uint64_t>(B, n - pos);
+            h_sizes[i] = sz;
+            total_vectors += (sz + V - 1) / V;
+            pos += sz;
+        }
+        
+        // 拷贝块信息到设备
+        uint64_t *d_starts = nullptr, *d_sizes = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_starts, numBlocks * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_sizes, numBlocks * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemcpyAsync(d_starts, h_starts.data(), numBlocks * sizeof(uint64_t), 
+                                cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_sizes, h_sizes.data(), numBlocks * sizeof(uint64_t), 
+                                cudaMemcpyHostToDevice, stream));
+        
+        // ==================== 阶段1：采样 ====================
+        uint8_t* d_modes = nullptr;
+        uint8_t* d_k_actual = nullptr;
+        uint8_t* d_k_combinations = nullptr;
+        uint8_t* d_alprd_right_bw = nullptr;
+        uint8_t* d_alprd_left_bw = nullptr;
+        uint32_t* d_alprd_dicts = nullptr;
+        
+        CUDA_CHECK(cudaMalloc(&d_modes, numBlocks));
+        CUDA_CHECK(cudaMalloc(&d_k_actual, numBlocks));
+        CUDA_CHECK(cudaMalloc(&d_k_combinations, numBlocks * 5 * 2)); // [blocks][5 combinations][e,f]
+        CUDA_CHECK(cudaMalloc(&d_alprd_right_bw, numBlocks));
+        CUDA_CHECK(cudaMalloc(&d_alprd_left_bw, numBlocks));
+        CUDA_CHECK(cudaMalloc(&d_alprd_dicts, numBlocks * DICT_SZ * sizeof(uint32_t)));
+        
+        dim3 sampling_grid(numBlocks);
+        dim3 sampling_block(32); // 每个rowgroup用少量线程
+        
+        kernel_rowgroup_sampling<T><<<sampling_grid, sampling_block, 0, stream>>>(
+            d_data, d_starts, d_sizes, numBlocks, V,
+            d_modes, d_k_actual, d_k_combinations,
+            d_alprd_right_bw, d_alprd_left_bw, d_alprd_dicts
+        );
+        
+        // ============== 新增：记录rowgroup采样结果 ==============
+        if (p.enable_recording && get_gpu_recording_enabled()) {
+            // 拷贝GPU结果到主机端进行记录
+            std::vector<uint8_t> h_modes(numBlocks);
+            std::vector<uint8_t> h_k_actual(numBlocks);
+            std::vector<uint8_t> h_k_combinations(numBlocks * 5 * 2);
+            
+            CUDA_CHECK(cudaMemcpyAsync(h_modes.data(), d_modes, numBlocks, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_k_actual.data(), d_k_actual, numBlocks, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_k_combinations.data(), d_k_combinations, numBlocks * 5 * 2, 
+                                    cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            
+            // 为每个rowgroup记录k组合
+            for(int blockId = 0; blockId < numBlocks; blockId++) {
+                if(h_modes[blockId] == 0) { // ALP模式
+                    std::vector<std::pair<std::pair<int, int>, int>> combinations;
+                    int k_count = h_k_actual[blockId];
+                    for(int i = 0; i < k_count; i++) {
+                        int base_idx = blockId * 5 * 2 + i * 2;
+                        int e = h_k_combinations[base_idx];
+                        int f = h_k_combinations[base_idx + 1];
+                        combinations.push_back({{e, f}, 1}); // count设为1，实际使用中可能需要更复杂的统计
+                    }
+                    record_gpu_rowgroup_combinations(combinations);
+                } else {
+                    // ALPrd模式不记录
+
+                }
+            }
+        }
+        
+        // ==================== 阶段2：向量参数选择 ====================
+        uint8_t* d_vec_e = nullptr;
+        uint8_t* d_vec_f = nullptr;
+        uint16_t* d_vec_bitw = nullptr;
+        int64_t* d_vec_FOR = nullptr;
+        uint16_t* d_vec_exc_cnt = nullptr;
+        uint64_t* d_vec_bit_sizes = nullptr;
+        
+        CUDA_CHECK(cudaMalloc(&d_vec_e, total_vectors));
+        CUDA_CHECK(cudaMalloc(&d_vec_f, total_vectors));
+        CUDA_CHECK(cudaMalloc(&d_vec_bitw, total_vectors * sizeof(uint16_t)));
+        CUDA_CHECK(cudaMalloc(&d_vec_FOR, total_vectors * sizeof(int64_t)));
+        CUDA_CHECK(cudaMalloc(&d_vec_exc_cnt, total_vectors * sizeof(uint16_t)));
+        CUDA_CHECK(cudaMalloc(&d_vec_bit_sizes, total_vectors * sizeof(uint64_t)));
+        
+        dim3 param_grid(numBlocks);
+        dim3 param_block(THREADS_PER_BLOCK);
+        
+        kernel_vector_parameter_selection<T><<<param_grid, param_block, 0, stream>>>(
+            d_data, d_starts, d_sizes,
+            d_modes, d_k_actual, d_k_combinations,
+            d_alprd_right_bw, d_alprd_left_bw, d_alprd_dicts,
+            numBlocks, V, total_vectors,
+            d_vec_e, d_vec_f, d_vec_bitw, d_vec_FOR, d_vec_exc_cnt, d_vec_bit_sizes
+        );
+        
+        // ============== 新增：记录向量(e,f)选择 ==============
+        if (p.enable_recording && get_gpu_recording_enabled()) {
+            // 拷贝向量参数到主机端
+            std::vector<uint8_t> h_vec_e(total_vectors);
+            std::vector<uint8_t> h_vec_f(total_vectors);
+            std::vector<uint8_t> h_modes_for_vectors(numBlocks);
+            
+            CUDA_CHECK(cudaMemcpyAsync(h_vec_e.data(), d_vec_e, total_vectors, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_vec_f.data(), d_vec_f, total_vectors, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_modes_for_vectors.data(), d_modes, numBlocks, cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            
+            // 记录每个向量的(e,f)选择
+            uint64_t vec_idx = 0;
+            for(int blockId = 0; blockId < numBlocks; blockId++) {
+                int numVec = (h_sizes[blockId] + V - 1) / V;
+                for(int v = 0; v < numVec; v++) {
+                    if(h_modes_for_vectors[blockId] == 0) { // ALP模式
+                        uint8_t e = h_vec_e[vec_idx];
+                        uint8_t f = h_vec_f[vec_idx];
+                        record_gpu_vector_ef(e, f);
+                    }
+                    // ALPrd模式的向量用0xFF标记，不记录
+                    vec_idx++;
+                }
+            }
+        }
+        
+        // 拷贝bit_sizes用于计算偏移
+        std::vector<uint64_t> h_vec_bit_sizes(total_vectors);
+        CUDA_CHECK(cudaMemcpyAsync(h_vec_bit_sizes.data(), d_vec_bit_sizes, 
+                                total_vectors * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        
+        // ==================== 计算偏移量 ====================
+        std::vector<uint64_t> h_block_offsets(numBlocks);
+        std::vector<uint64_t> h_vec_offsets(total_vectors);
+        
+        uint64_t block_offset = 0;
+        uint64_t vec_idx = 0;
+        
+        for(int b = 0; b < numBlocks; b++) {
+            h_block_offsets[b] = block_offset;
+            uint64_t current_offset = block_offset + 8; // block header
+            
+            int numVec = (h_sizes[b] + V - 1) / V;
+            for(int v = 0; v < numVec; v++) {
+                h_vec_offsets[vec_idx] = current_offset;
+                current_offset += h_vec_bit_sizes[vec_idx];
+                vec_idx++;
+            }
+            
+            // 块级padding
+            uint64_t block_bits = current_offset - block_offset;
+            uint64_t padding = (32 - (block_bits & 31)) & 31;
+            block_offset = current_offset + padding;
+        }
+        
+        const uint64_t total_bytes = (block_offset + 7) / 8;
+        
+        // ==================== 阶段3：压缩写入 ====================
+        CUDA_CHECK(cudaMalloc(&c.d_data, total_bytes));
+        CUDA_CHECK(cudaMemsetAsync(c.d_data, 0, total_bytes, stream));
+        c.data_size = total_bytes;
+        
+        // 拷贝偏移量到设备
+        uint64_t* d_vec_offsets = nullptr;
+        uint64_t* d_block_offsets = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_vec_offsets, total_vectors * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_block_offsets, numBlocks * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemcpyAsync(d_vec_offsets, h_vec_offsets.data(), 
+                                total_vectors * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_block_offsets, h_block_offsets.data(), 
+                                numBlocks * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+        
+        // 写入块头
+        kernel_write_rowgroup_headers<<<(numBlocks + 255) / 256, 256, 0, stream>>>(
+            d_sizes, d_block_offsets, numBlocks, V, c.d_data
+        );
+        
+        // 压缩写入数据
+        kernel_compress_and_write<T><<<param_grid, param_block, 0, stream>>>(
+            d_data, d_starts, d_sizes,
+            d_modes, d_alprd_right_bw, d_alprd_left_bw, d_alprd_dicts,
+            d_vec_offsets, d_vec_e, d_vec_f, d_vec_bitw, d_vec_FOR,
+            numBlocks, V, c.d_data
+        );
+        
+        // 设置元数据
+        c.offsets = std::move(h_block_offsets);
+        c.bit_sizes.resize(numBlocks);
+        vec_idx = 0;
+        for(int b = 0; b < numBlocks; b++) {
+            uint64_t block_bits = 8; // header
+            int numVec = (h_sizes[b] + V - 1) / V;
+            for(int v = 0; v < numVec; v++) {
+                block_bits += h_vec_bit_sizes[vec_idx++];
+            }
+            c.bit_sizes[b] = block_bits;
+        }
+        c.elem_counts.assign(h_sizes.begin(), h_sizes.end());
+        c.vectorSize = V;
+        
+        // ==================== 清理内存 ====================
+        CUDA_CHECK(cudaFree(d_block_offsets));
+        CUDA_CHECK(cudaFree(d_vec_offsets));
+        CUDA_CHECK(cudaFree(d_vec_bit_sizes));
+        CUDA_CHECK(cudaFree(d_vec_exc_cnt));
+        CUDA_CHECK(cudaFree(d_vec_FOR));
+        CUDA_CHECK(cudaFree(d_vec_bitw));
+        CUDA_CHECK(cudaFree(d_vec_f));
+        CUDA_CHECK(cudaFree(d_vec_e));
+        CUDA_CHECK(cudaFree(d_alprd_dicts));
+        CUDA_CHECK(cudaFree(d_alprd_left_bw));
+        CUDA_CHECK(cudaFree(d_alprd_right_bw));
+        CUDA_CHECK(cudaFree(d_k_combinations));
+        CUDA_CHECK(cudaFree(d_k_actual));
+        CUDA_CHECK(cudaFree(d_modes));
+        CUDA_CHECK(cudaFree(d_sizes));
+        CUDA_CHECK(cudaFree(d_starts));
+        
+        return c;
+    }
+
+    //  主机端
+    template<typename T>
+    static Compressed compress_impl(const T* h_data, size_t n, const Params& p) {
+        if (n == 0) {
+            Compressed c;
+            c.vectorSize = p.vectorSize;
+            return c;
+        }
+        
+        // 启用记录功能（如果参数中启用）
+        if (p.enable_recording) {
+            enable_gpu_alp_recording(true);
+        }
+        
+        // 分配设备内存并拷贝数据
+        T* d_data = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(T)));
+        CUDA_CHECK(cudaMemcpy(d_data, h_data, n * sizeof(T), cudaMemcpyHostToDevice));
+        
+        // 调用核心设备端实现
+        CompressedDevice device_result = compress_core_device<T>(d_data, n, p, 0);
+        
+        // 转换为主机端格式
+        Compressed host_result = device_to_host(device_result);
+        
+        // 清理
+        CUDA_CHECK(cudaFree(d_data));
+        
+        return host_result;
+    }
+
+    //  设备端
+    template<typename T>
+    static CompressedDevice compress_device_impl(const T* d_data, size_t n, const Params& p, cudaStream_t stream) {
+        // 启用记录功能（如果参数中启用）
+        if (p.enable_recording) {
+            enable_gpu_alp_recording(true);
+        }
+        
+        // 直接调用核心实现
+        return compress_core_device<T>(d_data, n, p, stream);
+    }
+
+    //  2.解压实现
+    template<typename T>
+    static void decompress_core_device(const uint8_t* d_compressed_data,
+                                    const std::vector<uint64_t>& offsets,
+                                    const std::vector<uint64_t>& bit_sizes,
+                                    const std::vector<uint32_t>& elem_counts,
+                                    int vectorSize,
+                                    T* d_output,
+                                    size_t output_size,
+                                    cudaStream_t stream) {
+        if (output_size == 0) return;
+        
+        const int numBlocks = (int)offsets.size();
+        if (numBlocks == 0) return;
+        
+        // 分配并拷贝元数据到设备
+        uint64_t *d_offsets = nullptr, *d_bit_sizes = nullptr, *d_output_starts = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_offsets, numBlocks * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_bit_sizes, numBlocks * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_output_starts, numBlocks * sizeof(uint64_t)));
+        
+        CUDA_CHECK(cudaMemcpyAsync(d_offsets, offsets.data(), numBlocks * sizeof(uint64_t), 
+                                cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_bit_sizes, bit_sizes.data(), numBlocks * sizeof(uint64_t), 
+                                cudaMemcpyHostToDevice, stream));
+        
+        // 计算输出起始位置
+        std::vector<uint64_t> output_starts(numBlocks);
+        uint64_t accumulated = 0;
+        for(int i = 0; i < numBlocks; i++) {
+            output_starts[i] = accumulated;
+            accumulated += elem_counts[i];
+        }
+        
+        CUDA_CHECK(cudaMemcpyAsync(d_output_starts, output_starts.data(), numBlocks * sizeof(uint64_t), 
+                                cudaMemcpyHostToDevice, stream));
+        
+        // 初始化输出数据（用于调试）
+        CUDA_CHECK(cudaMemsetAsync(d_output, 0, output_size * sizeof(T), stream));
+        
+        // 启动解压kernel
+        dim3 grid(numBlocks);
+        dim3 block(1); // 每个block用单线程处理一个压缩块
+        
+        kernel_decompress_debug<T><<<grid, block, 0, stream>>>(
+            d_compressed_data,
+            d_offsets,
+            d_bit_sizes, 
+            d_output_starts,
+            vectorSize,
+            d_output,
+            numBlocks
+        );
+        
+        // 清理设备内存
+        CUDA_CHECK(cudaFree(d_output_starts));
+        CUDA_CHECK(cudaFree(d_bit_sizes));
+        CUDA_CHECK(cudaFree(d_offsets));
+    }
+
+    // 主机端解压实现
+    template<typename T>
+    static void decompress_impl(const Compressed& compressed, 
+                                    T* h_output, 
+                                    size_t output_size, 
+                                    const Params& params) {
+        if (output_size == 0 || compressed.empty()) return;
+        
+        // 分配设备内存
+        uint8_t* d_compressed_data = nullptr;
+        T* d_output = nullptr;
+        
+        CUDA_CHECK(cudaMalloc(&d_compressed_data, compressed.data.size()));
+        CUDA_CHECK(cudaMalloc(&d_output, output_size * sizeof(T)));
+        
+        // 拷贝压缩数据到设备
+        CUDA_CHECK(cudaMemcpy(d_compressed_data, compressed.data.data(), 
+                            compressed.data.size(), cudaMemcpyHostToDevice));
+        
+        // 调用核心解压实现
+        decompress_core_device<T>(
+            d_compressed_data,
+            compressed.offsets,
+            compressed.bit_sizes,
+            compressed.elem_counts,
+            compressed.vectorSize,
+            d_output,
+            output_size,
+            0  // 默认stream
+        );
+        
+        // 等待GPU完成并拷贝结果回主机
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaMemcpy(h_output, d_output, output_size * sizeof(T), cudaMemcpyDeviceToHost));
+        
+        // 清理设备内存
+        CUDA_CHECK(cudaFree(d_output));
+        CUDA_CHECK(cudaFree(d_compressed_data));
+    }
+
+    // 设备端解压实现
+    template<typename T>
+    static void decompress_device_impl(const CompressedDevice& compressed_device, 
+                                            T* d_output, 
+                                            size_t output_size, 
+                                            const Params& params, 
+                                            cudaStream_t stream) {
+        // 直接调用核心实现，数据已在设备上
+        decompress_core_device<T>(
+            compressed_device.d_data,
+            compressed_device.offsets,
+            compressed_device.bit_sizes,
+            compressed_device.elem_counts,
+            compressed_device.vectorSize,
+            d_output,
+            output_size,
+            stream
+        );
+    }
+
+    //  主机端
+        Compressed compress_double(const double* data, size_t n, const Params& p) { 
+            return compress_impl<double>(data, n, p); 
+        }
+        Compressed compress_float(const float* data, size_t n, const Params& p) { 
+            return compress_impl<float>(data, n, p); 
+        }
+        void decompress_double(const Compressed& c, double* out, size_t n, const Params& p) { 
+            decompress_impl<double>(c, out, n, p); 
+        }
+        void decompress_float(const Compressed& c, float* out, size_t n, const Params& p) { 
+            decompress_impl<float>(c, out, n, p); 
+        }
+
+    //  设备端
+        CompressedDevice compress_double_device(const double* d_data, size_t n, const Params& p, cudaStream_t stream) {
+            return compress_device_impl<double>(d_data, n, p, stream);
+        }
+
+        CompressedDevice compress_float_device(const float* d_data, size_t n, const Params& p, cudaStream_t stream) {
+            return compress_device_impl<float>(d_data, n, p, stream);
+        }
+
+        void decompress_double_device(const CompressedDevice& c, double* d_out, size_t n, const Params& p, cudaStream_t stream) {
+            decompress_device_impl<double>(c, d_out, n, p, stream);
+        }
+
+        void decompress_float_device(const CompressedDevice& c, float* d_out, size_t n, const Params& p, cudaStream_t stream) {
+            decompress_device_impl<float>(c, d_out, n, p, stream);
+        }
+
+    // 数据交互函数
+    Compressed device_to_host(const CompressedDevice& cd) {
+        Compressed c;
+        c.data.resize(cd.data_size);
+        cudaMemcpy(c.data.data(), cd.d_data, cd.data_size, cudaMemcpyDeviceToHost);
+        c.offsets = cd.offsets;
+        c.bit_sizes = cd.bit_sizes;
+        c.elem_counts = cd.elem_counts;
+        c.vectorSize = cd.vectorSize;
+        return c;
+    }
+
+    CompressedDevice host_to_device(const Compressed& c) {
+        CompressedDevice cd;
+        cd.data_size = c.data.size();
+        cudaMalloc(&cd.d_data, cd.data_size);
+        cudaMemcpy(cd.d_data, c.data.data(), cd.data_size, cudaMemcpyHostToDevice);
+        cd.offsets = c.offsets;
+        cd.bit_sizes = c.bit_sizes;
+        cd.elem_counts = c.elem_counts;
+        cd.vectorSize = c.vectorSize;
+        return cd;
+    }
+
+    } // namespace alp_gpu
+*/
 
 #include "alp_gpu.hpp"
-#include <cuda_runtime.h>
-#include <cassert>
-#include <cmath>
-#include <algorithm>
-#include <numeric>
-#include <stdexcept>
-#include <iostream>
-#include <climits>
-#include <cstdlib>
-#include <vector>
 
 using std::uint8_t; using std::uint32_t; using std::uint64_t;
 
-// CUDA错误检查宏
-#define CUDA_CHECK(call) \
-    do { \
-        cudaError_t error = call; \
-        if (error != cudaSuccess) { \
-            std::cerr << "[CUDA Error] " << __FILE__ << ":" << __LINE__ \
-                      << " " << cudaGetErrorString(error) << std::endl; \
-        } \
-    } while(0)
-
 namespace alp_gpu {
 
-// ===================== 两级采样配置 =====================
-namespace sampling_config {
-    static constexpr int ROWGROUP_SIZE = 100000;
-    static constexpr int ROWGROUP_VECTOR_SAMPLES = 8;
-    static constexpr int SAMPLES_PER_VECTOR = 32;
-    static constexpr int MAX_K_COMBINATIONS = 5;
-    static constexpr int EARLY_EXIT_THRESHOLD = 2;
-}
-
-template<typename T> struct SamplingConstants {
-    static constexpr size_t RD_SIZE_THRESHOLD_LIMIT = 
-        sizeof(T) == 8 ? (48 * sampling_config::SAMPLES_PER_VECTOR) 
-                       : (22 * sampling_config::SAMPLES_PER_VECTOR);
-};
-
-// ===================== 常量 =====================
-__device__ __constant__ double D_EXP_ARR[19] = {
-  1.0, 10.0, 100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0,
-  100000000.0, 1000000000.0, 10000000000.0, 100000000000.0, 1000000000000.0,
-  10000000000000.0, 100000000000000.0, 1000000000000000.0,
-  10000000000000000.0, 100000000000000000.0, 1000000000000000000.0
-};
-__device__ __constant__ double D_FRAC_ARR[20] = {
-  1.0, 0.1, 0.01, 0.001, 0.0001, 0.00001, 0.000001, 0.0000001,
-  0.00000001, 0.000000001, 0.0000000001, 0.00000000001, 0.000000000001,
-  0.0000000000001, 0.00000000000001, 0.000000000000001, 0.0000000000000001,
-  0.00000000000000001, 0.000000000000000001
-};
-
-static constexpr int   DICT_BW  = 3;
-static constexpr int   DICT_SZ  = 1 << DICT_BW;
-static constexpr int   CUT_LIM  = 16;
-static constexpr int   MAX_VEC  = 4096;
-
-// ===================== 安全的设备端位流 Writer/Reader =====================
-struct SafeBitWriter {
-    uint8_t* buf;
-    uint64_t bitpos;
-    uint64_t max_bits;  // 最大可写位数
-    
-    __device__ SafeBitWriter(uint8_t* buffer, uint64_t start_bit, uint64_t buffer_size_bits)
-        : buf(buffer), bitpos(start_bit), max_bits(start_bit + buffer_size_bits) {}
-    
-    __device__ bool put1(int b){
-        if (bitpos >= max_bits) {
-            printf("[DEVICE-ERROR] BitWriter overflow at bit %llu (max %llu)\n", bitpos, max_bits);
-            return false;
-        }
-        if (!b) { ++bitpos; return true; }
-        
-        uint64_t byte = bitpos >> 3;
-        int off = 7 - int(bitpos & 7ULL);
-        
-        // 方法1：使用简单的非原子写入（如果每个向量由单独的线程处理，不会有竞争）
-        buf[byte] |= (uint8_t(1u) << off);
-        
-        // 方法2：如果确实需要原子操作，使用32位对齐的原子操作
-        // uint32_t* aligned = (uint32_t*)(buf + (byte & ~3ULL));
-        // int byte_offset = byte & 3;
-        // int bit_offset = byte_offset * 8 + off;
-        // atomicOr(aligned, uint32_t(1u) << bit_offset);
-        
-        ++bitpos;
-        return true;
+// 设备兼容的键值对结构，替代std::pair
+struct EFPair {
+    uint8_t exponent, factor;
+    __device__ EFPair() : exponent(0), factor(0) {}
+    __device__ EFPair(uint8_t e, uint8_t f) : exponent(e), factor(f) {}
+    __device__ bool equals(const EFPair& other) const {
+        return exponent == other.exponent && factor == other.factor;
     }
-    
-    __device__ bool putN(uint64_t v, int bits){
-        if (bits <= 0 || bits > 64) return false;
-        if (bitpos + bits > max_bits) {
-            printf("[DEVICE-ERROR] BitWriter would overflow: pos=%llu + bits=%d > max=%llu\n", 
-                   bitpos, bits, max_bits);
-            return false;
-        }
-        for(int i=bits-1;i>=0;--i) {
-            if (!put1( (v>>i) & 1ULL )) return false;
-        }
-        return true;
-    }
-    
-    __device__ uint64_t get_pos() const { return bitpos; }
-    __device__ uint64_t remaining_bits() const { return max_bits - bitpos; }
 };
 
-struct BitReader {
-    const uint8_t* buf;
-    uint64_t bitpos;
-    __device__ int get1(){
-        uint64_t byte = bitpos >> 3;
-        int off = 7 - int(bitpos & 7ULL);
-        int b = (buf[byte] >> off) & 1;
-        ++bitpos; return b;
-    }
-    __device__ uint64_t getN(int bits){
-        uint64_t v=0;
-        for(int i=0;i<bits;++i){ v = (v<<1) | get1(); }
-        return v;
-    }
-    __device__ uint64_t get_pos() const { return bitpos; }
-};
-
-// ===================== 工具函数 =====================
-__device__ __forceinline__ int width_needed_unsigned(unsigned long long range){
-    if (range==0ULL) return 1;
-    int c=0; while(range){ ++c; range>>=1ULL; } return c;
-}
-
-__device__ inline long long fast_round_double(double x){
-    const double SWEET = double((1ULL<<51) + (1ULL<<52));
-    return (long long)(x + SWEET) - (long long)SWEET;
-}
-
-__device__ inline uint32_t mask_lo(int bits){
-    return (bits >= 32) ? 0xFFFFFFFFu : ((1u<<bits) - 1u);
-}
-
-// ===================== ALP 判断与分析 =====================
+// 修正后的设备端ALP精确匹配检查 - 恢复原版本公式
 template<typename T>
-__device__ inline bool alp_exact_equal(T v, uint8_t e, uint8_t f){
+__device__ inline bool alp_exact_equal(T v, uint8_t e, uint8_t f)
+{
     if constexpr (std::is_same_v<T,double>) {
         double enc = v * D_EXP_ARR[e] * D_FRAC_ARR[f];
         long long I = fast_round_double(enc);
-        double dec = double(I) * (1.0 / D_FRAC_ARR[f]) * D_FRAC_ARR[e];
+        double dec = double(I) * D_FACT_ARR[f] * D_FRAC_ARR[e];
         return dec==v;
     } else {
         float enc = v * float(D_EXP_ARR[e]) * float(D_FRAC_ARR[f]);
@@ -175,15 +1407,20 @@ __device__ inline void alp_vector_analyze(const T* v, int n, uint8_t e, uint8_t 
     for(int i=0;i<n;++i){
         double enc = double(v[i]) * D_EXP_ARR[e] * D_FRAC_ARR[f];
         long long I = fast_round_double(enc);
-        double dec = double(I) * (1.0/double(D_FRAC_ARR[f])) * D_FRAC_ARR[e];
-        if (dec==double(v[i])) { mn=(mn<I?mn:I); mx=(mx>I?mx:I); }
-        else ++exc_cnt;
+        double dec = double(I) *  D_FACT_ARR[f] * D_FRAC_ARR[e];
+        if (dec==double(v[i])) { 
+            mn=(mn<I?mn:I); 
+            mx=(mx>I?mx:I); 
+        } else {
+            ++exc_cnt;
+        }
     }
     unsigned long long range = (mn==LLONG_MAX)? 0ULL : (unsigned long long)(mx - mn);
     bitw = (short)width_needed_unsigned(range);
     FOR  = (mn==LLONG_MAX?0:mn);
 }
 
+// 添加缺失的函数定义
 template<typename T>
 __device__ inline void alp_vector_choose_best_bits(
     const T* v, int n,
@@ -194,14 +1431,20 @@ __device__ inline void alp_vector_choose_best_bits(
     double best_score = 1e300;
     best_e=0; best_f=0; bitw=0; FOR=0; exc=0;
 
-    for(uint8_t e=0;e<=18;++e){
-        for(uint8_t f=0;f<=e;++f){
+    for(int8_t e_idx = Constants<T>::MAX_EXPONENT; e_idx >= 0; --e_idx){
+        for(int8_t f_idx = e_idx; f_idx >= 0; --f_idx){
             short _bw; long long _FOR; int _exc;
-            alp_vector_analyze<T>(v, n, e, f, _bw, _FOR, _exc);
+            alp_vector_analyze<T>(v, n, e_idx, f_idx, _bw, _FOR, _exc);
+            
             double score = double(n)*_bw + double(_exc)*(val_bits + 16);
+            
             if (score < best_score){
                 best_score = score;
-                best_e = e; best_f = f; bitw = _bw; FOR = _FOR; exc = _exc;
+                best_e = e_idx; 
+                best_f = f_idx; 
+                bitw = _bw; 
+                FOR = _FOR; 
+                exc = _exc;
             }
         }
     }
@@ -233,7 +1476,7 @@ __device__ inline bool alp_vector_write_safe(SafeBitWriter& bw, const T* v, int 
     for(int i=0;i<n;++i){
         double enc = double(v[i]) * D_EXP_ARR[e] * D_FRAC_ARR[f];
         long long I = fast_round_double(enc);
-        double dec = double(I) * (1.0/double(D_FRAC_ARR[f])) * D_FRAC_ARR[e];
+        double dec = double(I) * D_FACT_ARR[f] * D_FRAC_ARR[e];
         if (dec==double(v[i])) {
             uint64_t packed = (uint64_t)(I - FOR);
             if (!bw.putN(packed, bitw)) return false;
@@ -262,51 +1505,72 @@ __device__ inline bool alp_vector_write_safe(SafeBitWriter& bw, const T* v, int 
     return true;
 }
 
-// ===================== ALPrd 结构与函数 =====================
-template<typename T> struct ALPrdDict {
-    uint8_t rightBW;
-    uint8_t leftBW;
-    uint32_t dict[DICT_SZ];
-};
-
 template<typename T>
 __device__ inline void alprd_find_best(const uint64_t* in, int n, ALPrdDict<T>& D){
-    double best_score = 1e100; int best_rbw = int(sizeof(T)*8) - 1;
+    double best_score = 1e100; 
+    int best_rbw = int(sizeof(T)*8) - 1;
     uint32_t best_dict[DICT_SZ] = {0};
 
     for(int lbw=1; lbw<=CUT_LIM; ++lbw){
         int rbw = int(sizeof(T)*8) - lbw;
         uint32_t lmask = mask_lo(lbw);
 
-        uint32_t uniq_left[MAX_VEC]; int cnt[MAX_VEC];
+        uint32_t uniq_left[MAX_VEC]; 
+        int cnt[MAX_VEC];
         int u = 0;
 
         for(int i=0;i<n;++i){
             uint32_t left = (uint32_t)((in[i] >> rbw) & lmask);
-            int j=0; for(; j<u; ++j) if (uniq_left[j]==left) { ++cnt[j]; break; }
-            if (j==u){ uniq_left[u]=left; cnt[u]=1; ++u; }
+            int j=0; 
+            for(; j<u; ++j) {
+                if (uniq_left[j]==left) { 
+                    ++cnt[j]; 
+                    break; 
+                }
+            }
+            if (j==u){ 
+                uniq_left[u]=left; 
+                cnt[u]=1; 
+                ++u; 
+            }
         }
         
         uint32_t dict[DICT_SZ]={0};
         int used = (DICT_SZ < u ? DICT_SZ : u);
         for(int k=0;k<used;++k){
-            int best=-1, id=-1;
+            int best_cnt=-1, best_id=-1;
             for(int j=0;j<u;++j){
                 bool taken=false;
-                for(int t=0;t<k;++t) if (dict[t]==uniq_left[j]) { taken=true; break; }
+                for(int t=0;t<k;++t) {
+                    if (dict[t]==uniq_left[j]) { 
+                        taken=true; 
+                        break; 
+                    }
+                }
                 if (taken) continue;
-                if (cnt[j]>best){ best=cnt[j]; id=j; }
+                if (cnt[j]>best_cnt){ 
+                    best_cnt=cnt[j]; 
+                    best_id=j; 
+                }
             }
-            dict[k] = uniq_left[id];
+            if (best_id >= 0) {
+                dict[k] = uniq_left[best_id];
+            }
         }
         
         int keep=0;
         for(int k=0;k<used;++k){
-            for(int j=0;j<u;++j) if (uniq_left[j]==dict[k]) { keep += cnt[j]; break; }
+            for(int j=0;j<u;++j) {
+                if (uniq_left[j]==dict[k]) { 
+                    keep += cnt[j]; 
+                    break; 
+                }
+            }
         }
         int exc = n - keep;
 
-        double bits = 1 + 32 + 8 + double(n)*(DICT_BW + rbw) + double(DICT_SZ)*lbw + 16.0*exc + double(lbw)*exc;
+        double bits = 1 + 32 + 8 + double(n)*(DICT_BW + rbw) + 
+                     double(DICT_SZ)*lbw + 16.0*exc + double(lbw)*exc;
 
         if (bits < best_score){
             best_score = bits;
@@ -321,7 +1585,8 @@ __device__ inline void alprd_find_best(const uint64_t* in, int n, ALPrdDict<T>& 
 
 template<typename T>
 __device__ inline uint64_t alprd_vector_size_bits_safe(int n, const ALPrdDict<T>& D, int exc_cnt){
-    uint64_t base = 57ULL + uint64_t(n)*(DICT_BW + D.rightBW) + DICT_SZ*D.leftBW + uint64_t(exc_cnt)*(D.leftBW+16);
+    uint64_t base = 57ULL + uint64_t(n)*(DICT_BW + D.rightBW) + 
+                    DICT_SZ*D.leftBW + uint64_t(exc_cnt)*(D.leftBW+16);
     return base;
 }
 
@@ -334,7 +1599,9 @@ __device__ inline bool alprd_vector_write_safe(SafeBitWriter& bw, const uint64_t
     if (!bw.putN((uint64_t)n, 32)) return false;
     if (!bw.putN((uint64_t)D.rightBW, 8)) return false;
 
-    int exc_cnt=0; uint16_t exc_pos[MAX_VEC]; uint32_t exc_left[MAX_VEC];
+    int exc_cnt=0; 
+    uint16_t exc_pos[MAX_VEC]; 
+    uint32_t exc_left[MAX_VEC];
     uint64_t right_mask = (D.rightBW==64)? ~0ULL : ((1ULL<<D.rightBW)-1ULL);
     uint32_t left_mask  = mask_lo(D.leftBW);
 
@@ -342,7 +1609,12 @@ __device__ inline bool alprd_vector_write_safe(SafeBitWriter& bw, const uint64_t
         uint64_t right = in[i] & right_mask;
         uint32_t left  = (uint32_t)((in[i] >> D.rightBW) & left_mask);
         short idx = DICT_SZ;
-        for(int k=0;k<DICT_SZ;++k){ if (D.dict[k]==left){ idx=(short)k; break; } }
+        for(int k=0;k<DICT_SZ;++k){ 
+            if (D.dict[k]==left){ 
+                idx=(short)k; 
+                break; 
+            } 
+        }
         if (idx<DICT_SZ){
             if (!bw.putN((uint64_t)idx, DICT_BW)) return false;
             if (!bw.putN(right, D.rightBW)) return false;
@@ -367,7 +1639,7 @@ __device__ inline bool alprd_vector_write_safe(SafeBitWriter& bw, const uint64_t
     return true;
 }
 
-// ===================== 采样函数 =====================
+// 修正的采样函数，使用设备兼容的数组替代std::map
 template<typename T>
 __device__ void rowgroup_sample_and_find_k_combinations(
     const T* rowgroup_data, 
@@ -377,57 +1649,106 @@ __device__ void rowgroup_sample_and_find_k_combinations(
     int& k_actual,
     CompressionMode& mode
 ) {
-    int total_vectors = (rowgroup_size + vectorSize - 1) / vectorSize;
-    int sample_stride = max(1, total_vectors / sampling_config::ROWGROUP_VECTOR_SAMPLES);
+    const int available_alp_vectors = (rowgroup_size + vectorSize - 1) / vectorSize;
     
-    struct LocalStats {
-        int count;
-        double total_score;
-    } stats[19][19];
+    // 使用设备兼容的数组替代std::map
+    EFPair combinations_keys[19*19];
+    int combinations_values[19*19];
+    int combinations_count = 0;
     
-    for(int e=0; e<=18; e++) {
-        for(int f=0; f<=e; f++) {
-            stats[e][f].count = 0;
-            stats[e][f].total_score = 0;
-        }
-    }
-    
-    double best_overall_compression_size = 1e30;
-    int samples_taken = 0;
-    
-    for(int v = 0; v < total_vectors && samples_taken < sampling_config::ROWGROUP_VECTOR_SAMPLES; 
-        v += sample_stride) {
+    size_t best_estimated_compression_size = Constants<T>::RD_SIZE_THRESHOLD_LIMIT + 1;
+    //选择向量idx
+    for (size_t smp_n = 0; smp_n < config::ROWGROUP_VECTOR_SAMPLES && 
+        smp_n * config::ROWGROUP_SAMPLES_JUMP < available_alp_vectors; smp_n++) {
         
-        int vec_start = v * vectorSize;
-        int vec_size = min(vectorSize, rowgroup_size - vec_start);
-        if(vec_size <= 0) break;
+        size_t vector_idx = smp_n * config::ROWGROUP_SAMPLES_JUMP;
+        if (vector_idx >= available_alp_vectors) break;
+        
+        size_t vector_start = vector_idx * vectorSize;
+        size_t current_vector_size = (vectorSize < (rowgroup_size - vector_start)) ? 
+                                    vectorSize : (rowgroup_size - vector_start);
+        
+        if (current_vector_size < 2) continue;
+        //没有32个数据就全采样
+        const size_t samples_size = (config::SAMPLES_PER_VECTOR < current_vector_size) ? 
+                                config::SAMPLES_PER_VECTOR : current_vector_size;
+        const int sample_increments = (current_vector_size + samples_size - 1) / samples_size;
         
         T samples[32];
-        int sample_count = min(sampling_config::SAMPLES_PER_VECTOR, vec_size);
-        int sample_step = max(1, vec_size / sample_count);
-        
-        for(int i = 0; i < sample_count; i++) {
-            samples[i] = rowgroup_data[vec_start + i * sample_step];
+        for (size_t i = 0; i < samples_size; ++i) {
+            samples[i] = rowgroup_data[vector_start + i * sample_increments];
         }
         
-        uint8_t best_e = 0, best_f = 0;
-        short bitw; long long FOR; int exc;
-        alp_vector_choose_best_bits<T>(samples, sample_count, best_e, best_f, bitw, FOR, exc);
+        uint8_t found_exponent = 0;
+        uint8_t found_factor = 0;
+        uint64_t sample_estimated_compression_size = Constants<T>::RD_SIZE_THRESHOLD_LIMIT + 1;
         
-        int val_bits = std::is_same_v<T,double> ? 64 : 32;
-        double compression_size = sample_count * bitw + exc * (val_bits + 16);
-        
-        stats[best_e][best_f].count++;
-        stats[best_e][best_f].total_score += compression_size;
-        
-        if(compression_size < best_overall_compression_size) {
-            best_overall_compression_size = compression_size;
+        for (int8_t exp_ref = Constants<T>::MAX_EXPONENT; exp_ref >= 0; exp_ref--) {
+            for (int8_t factor_idx = exp_ref; factor_idx >= 0; factor_idx--) {
+                uint16_t exceptions_count = 0;
+                uint16_t non_exceptions_count = 0;
+                uint32_t estimated_bits_per_value = 0;
+                uint64_t estimated_compression_size = 0;
+                long long max_encoded_value = LLONG_MIN;
+                long long min_encoded_value = LLONG_MAX;
+                
+                for (size_t i = 0; i < samples_size; i++) {
+                    const T actual_value = samples[i];
+                    double enc = actual_value * D_EXP_ARR[exp_ref] * D_FRAC_ARR[factor_idx];
+                    long long encoded_value = fast_round_double(enc);
+                    double decoded_value = double(encoded_value) * D_FACT_ARR[factor_idx] * D_FRAC_ARR[exp_ref];
+                    
+                    if (decoded_value == double(actual_value)) {
+                        non_exceptions_count++;
+                        if (encoded_value > max_encoded_value) max_encoded_value = encoded_value;
+                        if (encoded_value < min_encoded_value) min_encoded_value = encoded_value;
+                    } else {
+                        exceptions_count++;
+                    }
+                }
+                
+                if (non_exceptions_count < 2) continue;
+                
+                unsigned long long range = (unsigned long long)(max_encoded_value - min_encoded_value);
+                estimated_bits_per_value = width_needed_unsigned(range);
+                estimated_compression_size += samples_size * estimated_bits_per_value;
+                estimated_compression_size += exceptions_count * (Constants<T>::EXCEPTION_SIZE + Constants<T>::EXCEPTION_POSITION_SIZE);
+                
+                if ((estimated_compression_size < sample_estimated_compression_size) ||
+                    (estimated_compression_size == sample_estimated_compression_size && 
+                    found_exponent < exp_ref) ||
+                    ((estimated_compression_size == sample_estimated_compression_size && 
+                    found_exponent == exp_ref) && 
+                    found_factor < factor_idx)) 
+                {
+                    sample_estimated_compression_size = estimated_compression_size;
+                    found_exponent = exp_ref;
+                    found_factor = factor_idx;
+                    if (sample_estimated_compression_size < best_estimated_compression_size) {
+                        best_estimated_compression_size = sample_estimated_compression_size;
+                    }
+                }
+            }
         }
         
-        samples_taken++;
+        // 记录找到的最佳组合，使用设备兼容的方法
+        EFPair key(found_exponent, found_factor);
+        bool found = false;
+        for(int i = 0; i < combinations_count; i++) {
+            if(combinations_keys[i].equals(key)) {
+                combinations_values[i]++;
+                found = true;
+                break;
+            }
+        }
+        if(!found && combinations_count < 19*19) {
+            combinations_keys[combinations_count] = key;
+            combinations_values[combinations_count] = 1;
+            combinations_count++;
+        }
     }
     
-    if(best_overall_compression_size >= SamplingConstants<T>::RD_SIZE_THRESHOLD_LIMIT) {
+    if (best_estimated_compression_size >= Constants<T>::RD_SIZE_THRESHOLD_LIMIT) {
         mode = CompressionMode::ALPrd;
         k_actual = 0;
         return;
@@ -435,34 +1756,30 @@ __device__ void rowgroup_sample_and_find_k_combinations(
     
     mode = CompressionMode::ALP;
     
-    EFCombination all_combinations[361];  
+    // 将组合转换为向量并排序
+    EFCombination all_combinations[19*19];
     int num_combinations = 0;
     
-    for(int e = 0; e <= 18; e++) {
-        for(int f = 0; f <= e; f++) {
-            if(stats[e][f].count > 0) {
-                all_combinations[num_combinations].e = e;
-                all_combinations[num_combinations].f = f;
-                all_combinations[num_combinations].count = stats[e][f].count;
-                all_combinations[num_combinations].score = 
-                    stats[e][f].total_score / stats[e][f].count;
-                num_combinations++;
-            }
-        }
+    for(int i = 0; i < combinations_count; i++) {
+        all_combinations[num_combinations].e = combinations_keys[i].exponent;
+        all_combinations[num_combinations].f = combinations_keys[i].factor;
+        all_combinations[num_combinations].count = combinations_values[i];
+        all_combinations[num_combinations].score = 0;
+        num_combinations++;
     }
     
-    for(int i = 0; i < num_combinations - 1; i++) {
-        for(int j = i + 1; j < num_combinations; j++) {
-            bool swap = false;
-            if(all_combinations[j].count > all_combinations[i].count) {
-                swap = true;
-            } else if(all_combinations[j].count == all_combinations[i].count) {
-                if(all_combinations[j].score < all_combinations[i].score) {
-                    swap = true;
-                }
+    // 与CPU版本相同的排序逻辑
+    for (int i = 0; i < num_combinations - 1; i++) {
+        for (int j = i + 1; j < num_combinations; j++) {
+            bool should_swap = false;
+            if ((all_combinations[j].count > all_combinations[i].count)||
+                ((all_combinations[j].count == all_combinations[i].count) && (all_combinations[j].e < all_combinations[i].e))||
+                ((all_combinations[j].count == all_combinations[i].count) && (all_combinations[j].e == all_combinations[i].e) && (all_combinations[j].f < all_combinations[i].f))) 
+            {
+                should_swap = true;
             }
             
-            if(swap) {
+            if (should_swap) {
                 EFCombination tmp = all_combinations[i];
                 all_combinations[i] = all_combinations[j];
                 all_combinations[j] = tmp;
@@ -470,12 +1787,14 @@ __device__ void rowgroup_sample_and_find_k_combinations(
         }
     }
     
-    k_actual = min(sampling_config::MAX_K_COMBINATIONS, num_combinations);
-    for(int i = 0; i < k_actual; i++) {
+    k_actual = (config::MAX_K_COMBINATIONS < num_combinations) ? 
+               config::MAX_K_COMBINATIONS : num_combinations;
+    for (int i = 0; i < k_actual; i++) {
         best_k_combinations[i] = all_combinations[i];
     }
 }
 
+// 修正的二级采样函数
 template<typename T>
 __device__ void vector_choose_from_k_combinations(
     const T* vec_data,
@@ -488,25 +1807,33 @@ __device__ void vector_choose_from_k_combinations(
     long long& FOR,
     int& exc
 ) {
-    if(k == 1) {
+    if (k == 0) {
+        // 如果没有k组合，使用完整分析
+        alp_vector_choose_best_bits<T>(vec_data, vec_size, best_e, best_f, bitw, FOR, exc);
+        return;
+    }
+    
+    if (k == 1) {
         best_e = k_combinations[0].e;
         best_f = k_combinations[0].f;
         alp_vector_analyze<T>(vec_data, vec_size, best_e, best_f, bitw, FOR, exc);
         return;
     }
     
+    // 二级采样
     T samples[32];
-    int sample_count = min(sampling_config::SAMPLES_PER_VECTOR, vec_size);
-    int sample_step = max(1, vec_size / sample_count);
+    const int sample_count = (config::SAMPLES_PER_VECTOR < vec_size) ? 
+                            config::SAMPLES_PER_VECTOR : vec_size;
+    const int sample_increments = (vec_size + sample_count - 1) / sample_count;
     
-    for(int i = 0; i < sample_count; i++) {
-        samples[i] = vec_data[i * sample_step];
+    for (int i = 0; i < sample_count; i++) {
+        samples[i] = vec_data[i * sample_increments];
     }
     
     double best_score = 1e30;
     int worse_count = 0;
     
-    for(int kid = 0; kid < k; kid++) {
+    for (int kid = 0; kid < k; kid++) {
         uint8_t e = k_combinations[kid].e;
         uint8_t f = k_combinations[kid].f;
         
@@ -518,282 +1845,25 @@ __device__ void vector_choose_from_k_combinations(
         int val_bits = std::is_same_v<T,double> ? 64 : 32;
         double score = sample_count * test_bitw + test_exc * (val_bits + 16);
         
-        if(score < best_score) {
+        if (score < best_score) {
             best_score = score;
             best_e = e;
             best_f = f;
             worse_count = 0;
         } else {
             worse_count++;
-            if(worse_count >= sampling_config::EARLY_EXIT_THRESHOLD) {
+            if (worse_count >= config::SAMPLING_EARLY_EXIT_THRESHOLD) {
                 break;
             }
         }
     }
     
+    // 在完整向量上分析最终参数
     alp_vector_analyze<T>(vec_data, vec_size, best_e, best_f, bitw, FOR, exc);
 }
 
-// ===================== 优化的并行Kernels =====================
 static constexpr int THREADS_PER_BLOCK = 128;
 
-// 优化的测量kernel - 增加并行度
-template<typename T>
-__global__ void kernel_measure_parallel(
-    const T* data,
-    const uint64_t* blk_starts,
-    const uint64_t* blk_sizes,
-    int numBlocks,
-    int vectorSize,
-    uint64_t* out_bits,
-    uint8_t* out_mode
-) {
-    int blockId = blockIdx.x;
-    if (blockId >= numBlocks) return;
-    
-    const T* blk = data + blk_starts[blockId];
-    int n = (int)blk_sizes[blockId];
-    int numVec = (n + vectorSize - 1) / vectorSize;
-    
-    // 采样阶段（仍需串行，但只是小部分工作）
-    __shared__ CompressionMode sh_mode;
-    __shared__ EFCombination sh_k_combinations[5];
-    __shared__ int sh_k_actual;
-    
-    if(threadIdx.x == 0) {
-        EFCombination k_combinations[5];
-        int k_actual;
-        CompressionMode mode;
-        
-        rowgroup_sample_and_find_k_combinations<T>(
-            blk, n, vectorSize,
-            k_combinations, k_actual, mode
-        );
-        
-        sh_mode = mode;
-        sh_k_actual = k_actual;
-        for(int i = 0; i < k_actual; i++) {
-            sh_k_combinations[i] = k_combinations[i];
-        }
-    }
-    __syncthreads();
-    
-    // 使用共享内存累加总位数
-    __shared__ uint64_t sh_partial_sums[THREADS_PER_BLOCK];
-    sh_partial_sums[threadIdx.x] = 0;
-    
-    if(sh_mode == CompressionMode::ALP) {
-        // 每个线程并行处理多个向量
-        for(int v = threadIdx.x; v < numVec; v += blockDim.x) {
-            int beg = v * vectorSize;
-            int rem = n - beg;
-            int len = (vectorSize < rem ? vectorSize : rem);
-            
-            uint8_t e, f;
-            short bw;
-            long long FOR;
-            int exc;
-            
-            vector_choose_from_k_combinations<T>(
-                blk + beg, len,
-                sh_k_combinations, sh_k_actual,
-                e, f, bw, FOR, exc
-            );
-            
-            uint64_t bits = alp_vector_size_bits_safe<T>(len, e, f, bw, exc);
-            sh_partial_sums[threadIdx.x] += bits;
-        }
-    } else {
-        // ALPrd模式的并行处理
-        for(int v = threadIdx.x; v < numVec; v += blockDim.x) {
-            int beg = v * vectorSize;
-            int rem = n - beg;
-            int len = (vectorSize < rem ? vectorSize : rem);
-            
-            uint64_t tmp[MAX_VEC];
-            for(int i = 0; i < len; i++) {
-                if constexpr (std::is_same_v<T,double>) 
-                    tmp[i] = *reinterpret_cast<const uint64_t*>(&blk[beg+i]);
-                else 
-                    tmp[i] = *reinterpret_cast<const uint32_t*>(&blk[beg+i]);
-            }
-            
-            ALPrdDict<T> D;
-            alprd_find_best<T>(tmp, len, D);
-            
-            int exc = 0;
-            for(int i = 0; i < len; i++) {
-                uint32_t left = (uint32_t)((tmp[i] >> D.rightBW) & mask_lo(D.leftBW));
-                bool inDict = false;
-                for(int k = 0; k < DICT_SZ; k++) {
-                    if(D.dict[k] == left) {
-                        inDict = true;
-                        break;
-                    }
-                }
-                if(!inDict) exc++;
-            }
-            
-            uint64_t bits = alprd_vector_size_bits_safe<T>(len, D, exc);
-            sh_partial_sums[threadIdx.x] += bits;
-        }
-    }
-    
-    __syncthreads();
-    
-    // 归约求和
-    for(int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if(threadIdx.x < stride) {
-            sh_partial_sums[threadIdx.x] += sh_partial_sums[threadIdx.x + stride];
-        }
-        __syncthreads();
-    }
-    
-    if(threadIdx.x == 0) {
-        out_bits[blockId] = 8 + sh_partial_sums[0];  // 8位是行组头
-        out_mode[blockId] = (sh_mode == CompressionMode::ALPrd) ? 1 : 0;
-    }
-}
-
-// 计算每个向量元数据的kernel（添加调试信息）
-template<typename T>
-__global__ void kernel_compute_vector_metadata(
-    const T* data,
-    const uint64_t* blk_starts,
-    const uint64_t* blk_sizes,
-    const uint8_t* modes,
-    int numBlocks,
-    int vectorSize,
-    uint64_t* vec_bit_sizes,
-    uint8_t* vec_e,
-    uint8_t* vec_f,
-    uint16_t* vec_bitw,
-    int64_t* vec_FOR,
-    uint32_t* vec_exc_cnt
-) {
-    int blockId = blockIdx.x;
-    if (blockId >= numBlocks) return;
-    
-    const T* blk = data + blk_starts[blockId];
-    int n = (int)blk_sizes[blockId];
-    int numVec = (n + vectorSize - 1) / vectorSize;
-    CompressionMode mode = (modes[blockId] ? CompressionMode::ALPrd : CompressionMode::ALP);
-    
-    // 重新采样获取k个组合
-    __shared__ EFCombination sh_k_combinations[5];
-    __shared__ int sh_k_actual;
-    __shared__ CompressionMode sh_mode;
-    
-    if(threadIdx.x == 0) {
-        EFCombination k_combinations[5];
-        int k_actual;
-        CompressionMode mode_check;
-        rowgroup_sample_and_find_k_combinations<T>(
-            blk, n, vectorSize,
-            k_combinations, k_actual, mode_check
-        );
-        sh_k_actual = k_actual;
-        sh_mode = mode;
-        for(int i = 0; i < k_actual; i++) {
-            sh_k_combinations[i] = k_combinations[i];
-        }
-        
-        // 调试：打印第一个块的信息
-        // if(blockId == 0) {
-        //     printf("[DEVICE-METADATA] Block0: n=%d, numVec=%d, mode=%s, k_actual=%d\n",
-        //            n, numVec, mode == CompressionMode::ALP ? "ALP" : "ALPrd", k_actual);
-        // }
-    }
-    __syncthreads();
-    
-    // 计算全局向量索引基址
-    uint64_t vec_base = 0;
-    for(int b = 0; b < blockId; b++) {
-        vec_base += (blk_sizes[b] + vectorSize - 1) / vectorSize;
-    }
-    
-    // 每个线程并行处理不同的向量
-    for(int v = threadIdx.x; v < numVec; v += blockDim.x) {
-        uint64_t global_vec_idx = vec_base + v;
-        int beg = v * vectorSize;
-        int rem = n - beg;
-        int len = (vectorSize < rem ? vectorSize : rem);
-        
-        if(sh_mode == CompressionMode::ALP) {
-            uint8_t e, f;
-            short bitw;
-            long long FOR;
-            int exc;
-            
-            vector_choose_from_k_combinations<T>(
-                blk + beg, len,
-                sh_k_combinations, sh_k_actual,
-                e, f, bitw, FOR, exc
-            );
-            
-            uint64_t bits = alp_vector_size_bits_safe<T>(len, e, f, bitw, exc);
-            
-            // 调试：检查异常位数
-            // if(blockId == 0 && v == 0) {
-            //     printf("[DEVICE-METADATA] Vec0: e=%d f=%d bitw=%d exc=%d bits=%llu\n",
-            //            e, f, bitw, exc, bits);
-            // }
-            
-            vec_bit_sizes[global_vec_idx] = bits;
-            vec_e[global_vec_idx] = e;
-            vec_f[global_vec_idx] = f;
-            vec_bitw[global_vec_idx] = bitw;
-            vec_FOR[global_vec_idx] = FOR;
-            vec_exc_cnt[global_vec_idx] = exc;
-            
-        } else {
-            // ALPrd模式
-            uint64_t tmp[MAX_VEC];
-            for(int i = 0; i < len; i++) {
-                if constexpr (std::is_same_v<T,double>) 
-                    tmp[i] = *reinterpret_cast<const uint64_t*>(&blk[beg+i]);
-                else 
-                    tmp[i] = *reinterpret_cast<const uint32_t*>(&blk[beg+i]);
-            }
-            
-            ALPrdDict<T> D;
-            alprd_find_best<T>(tmp, len, D);
-            
-            int exc = 0;
-            for(int i = 0; i < len; i++) {
-                uint32_t left = (uint32_t)((tmp[i] >> D.rightBW) & mask_lo(D.leftBW));
-                bool inDict = false;
-                for(int k = 0; k < DICT_SZ; k++) {
-                    if(D.dict[k] == left) {
-                        inDict = true;
-                        break;
-                    }
-                }
-                if(!inDict) exc++;
-            }
-            
-            uint64_t bits = alprd_vector_size_bits_safe<T>(len, D, exc);
-            
-            // // 调试：检查ALPrd位数
-            // if(blockId == 0 && v == 0) {
-            //     printf("[DEVICE-METADATA] ALPrd Vec0: rbw=%d lbw=%d exc=%d bits=%llu\n",
-            //            D.rightBW, D.leftBW, exc, bits);
-            // }
-            
-            // 检查异常值：如果位数太大，可能有问题
-            if(bits > 100000) {
-                printf("[DEVICE-WARNING] Block%d Vec%d: ALPrd bits=%llu too large! exc=%d\n",
-                       blockId, v, bits, exc);
-            }
-            
-            vec_bit_sizes[global_vec_idx] = bits;
-            vec_e[global_vec_idx] = 0xFF;  // 标记为ALPrd
-            vec_f[global_vec_idx] = 0xFF;
-        }
-    }
-}
-
-// 写入行组头的kernel
 __global__ void kernel_write_rowgroup_headers(
     const uint64_t* blk_sizes,
     const uint64_t* blk_offsets,
@@ -807,14 +1877,175 @@ __global__ void kernel_write_rowgroup_headers(
     int numVec = (blk_sizes[blockId] + vectorSize - 1) / vectorSize;
     uint64_t bit_offset = blk_offsets[blockId];
     
-    // 写入8位行组头
     SafeBitWriter bw(out_bytes, bit_offset, 8);
     bw.putN((uint64_t)numVec, 8);
 }
 
-// 并行写入kernel
+// ==================== 修改：移除预计算字典，改回原版本方式 ====================
 template<typename T>
-__global__ void kernel_parallel_emit(
+__global__ void kernel_rowgroup_sampling(
+    const T* data,
+    const uint64_t* blk_starts,
+    const uint64_t* blk_sizes,
+    int numBlocks,
+    int vectorSize,
+    // 输出每个rowgroup的采样结果 (只保留ALP相关的输出)
+    uint8_t* out_modes,           // 0=ALP, 1=ALPrd
+    uint8_t* out_k_actual,        // 每个rowgroup的k组合数量
+    uint8_t* out_k_combinations   // [numBlocks][5][2] 存储(e,f)组合
+) {
+    int blockId = blockIdx.x;
+    if (blockId >= numBlocks) return;
+    
+    const T* blk = data + blk_starts[blockId];
+    int n = (int)blk_sizes[blockId];
+    
+    // 每个block用一个线程完成采样（避免线程间通信复杂性）
+    if (threadIdx.x == 0) {
+        EFCombination k_combinations[5];
+        int k_actual;
+        CompressionMode mode;
+        
+        // 核心采样逻辑（只执行一次）
+        rowgroup_sample_and_find_k_combinations<T>(
+            blk, n, vectorSize, k_combinations, k_actual, mode
+        );
+        
+        // 保存采样结果
+        out_modes[blockId] = (mode == CompressionMode::ALPrd) ? 1 : 0;
+        out_k_actual[blockId] = k_actual;
+        
+        if (mode == CompressionMode::ALP) {
+            // 保存ALP的k组合
+            for(int i = 0; i < k_actual; i++) {
+                int base_idx = blockId * 5 * 2 + i * 2;
+                out_k_combinations[base_idx] = k_combinations[i].e;
+                out_k_combinations[base_idx + 1] = k_combinations[i].f;
+            }
+        }
+        // ALPrd模式：不预计算字典，与原版本一致
+    }
+}
+
+// ==================== 修改：ALPrd每次重新计算字典 ====================
+template<typename T>
+__global__ void kernel_vector_parameter_selection(
+    const T* data,
+    const uint64_t* blk_starts,
+    const uint64_t* blk_sizes,
+    const uint8_t* modes,
+    const uint8_t* k_actual,
+    const uint8_t* k_combinations,
+    int numBlocks,
+    int vectorSize,
+    uint64_t total_vectors,
+    // 输出每个向量的参数
+    uint8_t* vec_e,
+    uint8_t* vec_f,
+    uint16_t* vec_bitw,
+    int64_t* vec_FOR,
+    uint16_t* vec_exc_cnt,
+    uint64_t* vec_bit_sizes
+) {
+    int blockId = blockIdx.x;
+    if (blockId >= numBlocks) return;
+    
+    const T* blk = data + blk_starts[blockId];
+    int n = (int)blk_sizes[blockId];
+    int numVec = (n + vectorSize - 1) / vectorSize;
+    CompressionMode mode = (modes[blockId] == 1) ? CompressionMode::ALPrd : CompressionMode::ALP;
+    
+    // 计算全局向量索引基址
+    uint64_t vec_base = 0;
+    for(int b = 0; b < blockId; b++) {
+        vec_base += (blk_sizes[b] + vectorSize - 1) / vectorSize;
+    }
+    
+    if (mode == CompressionMode::ALP) {
+        // 重建k组合数组
+        EFCombination local_k_combinations[5];
+        int local_k_actual = k_actual[blockId];
+        
+        for(int i = 0; i < local_k_actual; i++) {
+            int base_idx = blockId * 5 * 2 + i * 2;
+            local_k_combinations[i].e = k_combinations[base_idx];
+            local_k_combinations[i].f = k_combinations[base_idx + 1];
+        }
+        
+        // 并行处理每个向量
+        for(int v = threadIdx.x; v < numVec; v += blockDim.x) {
+            uint64_t global_vec_idx = vec_base + v;
+            int beg = v * vectorSize;
+            int rem = n - beg;
+            int len = (vectorSize < rem ? vectorSize : rem);
+            
+            uint8_t e, f;
+            short bitw;
+            long long FOR;
+            int exc;
+            
+            // 对应CPU的 find_best_exponent_factor_from_combinations
+            vector_choose_from_k_combinations<T>(
+                blk + beg, len,
+                local_k_combinations, local_k_actual,
+                e, f, bitw, FOR, exc
+            );
+            
+            // 保存参数
+            vec_e[global_vec_idx] = e;
+            vec_f[global_vec_idx] = f;
+            vec_bitw[global_vec_idx] = bitw;
+            vec_FOR[global_vec_idx] = FOR;
+            vec_exc_cnt[global_vec_idx] = exc;
+            vec_bit_sizes[global_vec_idx] = alp_vector_size_bits_safe<T>(len, e, f, bitw, exc);
+        }
+    } else {
+        // ALPrd模式：每个向量重新计算字典（与原版本一致）
+        for(int v = threadIdx.x; v < numVec; v += blockDim.x) {
+            uint64_t global_vec_idx = vec_base + v;
+            int beg = v * vectorSize;
+            int rem = n - beg;
+            int len = (vectorSize < rem ? vectorSize : rem);
+            
+            // 转换为raw数据格式
+            uint64_t tmp[MAX_VEC];
+            for(int i = 0; i < len; i++) {
+                if constexpr (std::is_same_v<T,double>) 
+                    tmp[i] = *reinterpret_cast<const uint64_t*>(&blk[beg+i]);
+                else 
+                    tmp[i] = *reinterpret_cast<const uint32_t*>(&blk[beg+i]);
+            }
+            
+            // 重新计算字典（与原版本一致）
+            ALPrdDict<T> D;
+            alprd_find_best<T>(tmp, len, D);
+            
+            // 计算异常数量
+            int exc = 0;
+            for(int i = 0; i < len; i++) {
+                uint32_t left = (uint32_t)((tmp[i] >> D.rightBW) & mask_lo(D.leftBW));
+                bool inDict = false;
+                for(int k = 0; k < DICT_SZ; k++) {
+                    if(D.dict[k] == left) {
+                        inDict = true;
+                        break;
+                    }
+                }
+                if(!inDict) exc++;
+            }
+            
+            // ALPrd标记
+            vec_e[global_vec_idx] = 0xFF;
+            vec_f[global_vec_idx] = 0xFF;
+            vec_exc_cnt[global_vec_idx] = exc;
+            vec_bit_sizes[global_vec_idx] = alprd_vector_size_bits_safe<T>(len, D, exc);
+        }
+    }
+}
+
+// ==================== 修改：ALPrd压缩时重新计算字典 ====================
+template<typename T>
+__global__ void kernel_compress_and_write(
     const T* data,
     const uint64_t* blk_starts,
     const uint64_t* blk_sizes,
@@ -834,7 +2065,7 @@ __global__ void kernel_parallel_emit(
     const T* blk = data + blk_starts[blockId];
     int n = (int)blk_sizes[blockId];
     int numVec = (n + vectorSize - 1) / vectorSize;
-    CompressionMode mode = (modes[blockId] ? CompressionMode::ALPrd : CompressionMode::ALP);
+    CompressionMode mode = (modes[blockId] == 1) ? CompressionMode::ALPrd : CompressionMode::ALP;
     
     // 计算全局向量索引基址
     uint64_t vec_base = 0;
@@ -842,7 +2073,7 @@ __global__ void kernel_parallel_emit(
         vec_base += (blk_sizes[b] + vectorSize - 1) / vectorSize;
     }
     
-    // 每个线程并行写入自己负责的向量
+    // 并行写入每个向量
     for(int v = threadIdx.x; v < numVec; v += blockDim.x) {
         uint64_t global_vec_idx = vec_base + v;
         int beg = v * vectorSize;
@@ -850,9 +2081,10 @@ __global__ void kernel_parallel_emit(
         int len = (vectorSize < rem ? vectorSize : rem);
         
         uint64_t bit_offset = vec_bit_offsets[global_vec_idx];
-        SafeBitWriter bw(out_bytes, bit_offset, 100000);
+        SafeBitWriter bw(out_bytes, bit_offset, 100000); // 充足的缓冲区
         
         if(mode == CompressionMode::ALP) {
+            // ALP压缩写入
             uint8_t e = vec_e[global_vec_idx];
             uint8_t f = vec_f[global_vec_idx];
             short bitw = vec_bitw[global_vec_idx];
@@ -861,7 +2093,7 @@ __global__ void kernel_parallel_emit(
             alp_vector_write_safe<T>(bw, blk + beg, len, e, f, bitw, FOR);
             
         } else {
-            // ALPrd需要重新计算
+            // ALPrd压缩写入：重新计算字典（与原版本一致）
             uint64_t tmp[MAX_VEC];
             for(int i = 0; i < len; i++) {
                 if constexpr (std::is_same_v<T,double>) 
@@ -870,6 +2102,7 @@ __global__ void kernel_parallel_emit(
                     tmp[i] = *reinterpret_cast<const uint32_t*>(&blk[beg+i]);
             }
             
+            // 重新计算字典（与原版本一致）
             ALPrdDict<T> D;
             alprd_find_best<T>(tmp, len, D);
             alprd_vector_write_safe<T>(bw, tmp, len, D);
@@ -877,7 +2110,6 @@ __global__ void kernel_parallel_emit(
     }
 }
 
-// 解压kernel
 template<typename T>
 __global__ void kernel_decompress_debug(const uint8_t* bytes,
                                         const uint64_t* blk_starts_bits,
@@ -893,15 +2125,8 @@ __global__ void kernel_decompress_debug(const uint8_t* bytes,
     BitReader br{bytes, bit_offset};
     
     int numVec = (int)br.getN(8);
-    
-    // if (blockId == 0) {
-    //     printf("[DEVICE-DECOMP] Block0: bit_offset=%llu, numVec=%d\n", bit_offset, numVec);
-    // }
 
     if (numVec <= 0 || numVec > 10000) {
-        if (blockId == 0) {
-            printf("[DEVICE-ERROR] Invalid numVec: %d\n", numVec);
-        }
         return;
     }
 
@@ -909,10 +2134,6 @@ __global__ void kernel_decompress_debug(const uint8_t* bytes,
     
     for(int v = 0; v < numVec; v++) {
         int useALP = br.get1();
-        
-        // if (blockId == 0 && v == 0) {
-        //     printf("[DEVICE-DECOMP] Vec0: useALP=%d\n", useALP);
-        // }
 
         if (useALP) {
             uint8_t e = (uint8_t)br.getN(8);
@@ -920,17 +2141,13 @@ __global__ void kernel_decompress_debug(const uint8_t* bytes,
             short bitw = (short)br.getN(16);
             long long FOR = (long long)br.getN(64);
             int n = (int)br.getN(32);
-            
-            // if (blockId == 0 && v == 0) {
-            //     printf("[DEVICE-DECOMP] Vec0 ALP: e=%d f=%d bitw=%d n=%d\n", e, f, bitw, n);
-            // }
 
             if (n <= 0 || n > MAX_VEC) return;
 
             for(int k = 0; k < n; k++) {
                 uint64_t enc = br.getN(bitw);
                 long long I = FOR + (long long)enc;
-                double dec = double(I) * (1.0/double(D_FRAC_ARR[f])) * D_FRAC_ARR[e];
+                double dec = double(I) * (1.0/double(D_FRAC_ARR[f])) * D_FRAC_ARR[e]; // 恢复原版本公式
                 out_data[out_pos + k] = (T)dec;
             }
 
@@ -1012,319 +2229,20 @@ __global__ void kernel_decompress_debug(const uint8_t* bytes,
     }
 }
 
-// ===================== 优化的主要API实现 =====================
+//  ==================== 核心设备端压缩实现（修改版） ====================
 template<typename T>
-static Compressed compress_impl_optimized(const T* h_data, size_t n, const Params& p) {
-    // std::cout << "[DEBUG] 开始优化压缩，数据量: " << n << std::endl;
-    
-    Compressed c;
-    if (n == 0) { c.vectorSize = p.vectorSize; return c; }
-    
-    const int V = p.vectorSize;
-    const int B = p.blockSize > 0 ? p.blockSize : int(n);
-    const int numBlocks = int((n + B - 1) / B);
-    
-    // std::cout << "[DEBUG] 块数: " << numBlocks << ", 向量大小: " << V << std::endl;
-    
-    // 计算总向量数
-    uint64_t total_vectors = 0;
-    std::vector<uint64_t> h_starts(numBlocks), h_sizes(numBlocks);
-    size_t pos = 0;
-    for(int i = 0; i < numBlocks; i++) {
-        h_starts[i] = pos;
-        uint64_t sz = std::min<uint64_t>(B, n - pos);
-        h_sizes[i] = sz;
-        total_vectors += (sz + V - 1) / V;
-        pos += sz;
-    }
-    
-    // std::cout << "[DEBUG] 总向量数: " << total_vectors << std::endl;
-    
-    // 上传数据到GPU
-    T* d_data = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(T)));
-    CUDA_CHECK(cudaMemcpy(d_data, h_data, n * sizeof(T), cudaMemcpyHostToDevice));
-    
-    uint64_t *d_starts = nullptr, *d_sizes = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_starts, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_sizes, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpy(d_starts, h_starts.data(), numBlocks * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_sizes, h_sizes.data(), numBlocks * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    
-    // 第一阶段：并行测量
-    uint64_t* d_bits = nullptr;
-    uint8_t* d_mode = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_bits, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_mode, numBlocks * sizeof(uint8_t)));
-    
-    dim3 grid1(numBlocks);
-    dim3 block1(THREADS_PER_BLOCK);
-    
-    kernel_measure_parallel<T><<<grid1, block1>>>(
-        d_data, d_starts, d_sizes, numBlocks, V,
-        d_bits, d_mode
-    );
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    std::vector<uint64_t> h_bits(numBlocks);
-    std::vector<uint8_t> h_mode(numBlocks);
-    CUDA_CHECK(cudaMemcpy(h_bits.data(), d_bits, numBlocks * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_mode.data(), d_mode, numBlocks * sizeof(uint8_t), cudaMemcpyDeviceToHost));
-    
-    // 调试输出
-    // std::cout << "[DEBUG] 各块压缩位数: ";
-    // for (int i = 0; i < std::min(5, numBlocks); i++) {
-    //     std::cout << h_bits[i] << "(" << (h_mode[i] ? "ALPrd" : "ALP") << ") ";
-    // }
-    // std::cout << std::endl;
-    
-    // 第二阶段：计算每个向量的元数据
-    uint64_t* d_vec_bit_sizes = nullptr;
-    uint8_t* d_vec_e = nullptr;
-    uint8_t* d_vec_f = nullptr;
-    uint16_t* d_vec_bitw = nullptr;
-    int64_t* d_vec_FOR = nullptr;
-    uint32_t* d_vec_exc_cnt = nullptr;
-    
-    CUDA_CHECK(cudaMalloc(&d_vec_bit_sizes, total_vectors * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_vec_e, total_vectors * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMalloc(&d_vec_f, total_vectors * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMalloc(&d_vec_bitw, total_vectors * sizeof(uint16_t)));
-    CUDA_CHECK(cudaMalloc(&d_vec_FOR, total_vectors * sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&d_vec_exc_cnt, total_vectors * sizeof(uint32_t)));
-    
-    kernel_compute_vector_metadata<T><<<grid1, block1>>>(
-        d_data, d_starts, d_sizes, d_mode,
-        numBlocks, V,
-        d_vec_bit_sizes, d_vec_e, d_vec_f,
-        d_vec_bitw, d_vec_FOR, d_vec_exc_cnt
-    );
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // 第三阶段：计算位偏移
-    std::vector<uint64_t> h_vec_bit_sizes(total_vectors);
-    CUDA_CHECK(cudaMemcpy(h_vec_bit_sizes.data(), d_vec_bit_sizes, 
-                          total_vectors * sizeof(uint64_t), cudaMemcpyDeviceToHost));
-    
-    std::vector<uint64_t> h_block_offsets(numBlocks);
-    std::vector<uint64_t> h_vec_offsets(total_vectors);
-    
-    uint64_t block_offset = 0;
-    uint64_t vec_idx = 0;
-    
-    for(int b = 0; b < numBlocks; b++) {
-        h_block_offsets[b] = block_offset;
-        
-        // 行组头（8位）
-        uint64_t current_offset = block_offset + 8;
-        
-        int numVec = (h_sizes[b] + V - 1) / V;
-        for(int v = 0; v < numVec; v++) {
-            h_vec_offsets[vec_idx] = current_offset;
-            current_offset += h_vec_bit_sizes[vec_idx];
-            vec_idx++;
-        }
-        
-        // 对齐到32位边界
-        uint64_t block_bits = current_offset - block_offset;
-        uint64_t padding = (32 - (block_bits & 31)) & 31;
-        block_offset = current_offset + padding;
-    }
-    
-    const uint64_t total_bits = block_offset;
-    const uint64_t total_bytes = (total_bits + 7) / 8;
-    
-    // std::cout << "[DEBUG] 优化后总位数: " << total_bits << std::endl;
-    // std::cout << "[DEBUG] 优化后总字节数: " << total_bytes << std::endl;
-    
-    uint64_t* d_vec_offsets = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_vec_offsets, total_vectors * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpy(d_vec_offsets, h_vec_offsets.data(), 
-                         total_vectors * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    
-    // 第四阶段：并行写入压缩数据
-    uint8_t* d_out = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_out, total_bytes));
-    CUDA_CHECK(cudaMemset(d_out, 0, total_bytes));
-    
-    // 写入行组头（使用设备端kernel写入以确保正确性）
-    uint64_t* d_block_offsets = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_block_offsets, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpy(d_block_offsets, h_block_offsets.data(), 
-                         numBlocks * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    
-    // 使用kernel写入行组头
-    int header_threads = std::min(numBlocks, 256);
-    int header_blocks = (numBlocks + header_threads - 1) / header_threads;
-    kernel_write_rowgroup_headers<<<header_blocks, header_threads>>>(
-        d_sizes, d_block_offsets, numBlocks, V, d_out
-    );
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    // 并行写入所有向量
-    kernel_parallel_emit<T><<<grid1, block1>>>(
-        d_data, d_starts, d_sizes, d_mode,
-        d_vec_offsets, d_vec_e, d_vec_f,
-        d_vec_bitw, d_vec_FOR,
-        numBlocks, V, d_out
-    );
-    CUDA_CHECK(cudaDeviceSynchronize());
-    
-    CUDA_CHECK(cudaFree(d_block_offsets));
-    
-    // 第五阶段：拷回结果
-    c.data.resize(total_bytes);
-    CUDA_CHECK(cudaMemcpy(c.data.data(), d_out, total_bytes, cudaMemcpyDeviceToHost));
-    
-    // 填充压缩元数据
-    c.offsets = std::move(h_block_offsets);
-    c.bit_sizes.resize(numBlocks);
-    vec_idx = 0;
-    for(int b = 0; b < numBlocks; b++) {
-        uint64_t block_bits = 8; // 行组头
-        int numVec = (h_sizes[b] + V - 1) / V;
-        for(int v = 0; v < numVec; v++) {
-            block_bits += h_vec_bit_sizes[vec_idx++];
-        }
-        c.bit_sizes[b] = block_bits;
-    }
-    c.elem_counts.assign(h_sizes.begin(), h_sizes.end());
-    c.vectorSize = V;
-    
-    // 清理GPU内存
-    CUDA_CHECK(cudaFree(d_vec_offsets));
-    CUDA_CHECK(cudaFree(d_vec_exc_cnt));
-    CUDA_CHECK(cudaFree(d_vec_FOR));
-    CUDA_CHECK(cudaFree(d_vec_bitw));
-    CUDA_CHECK(cudaFree(d_vec_f));
-    CUDA_CHECK(cudaFree(d_vec_e));
-    CUDA_CHECK(cudaFree(d_vec_bit_sizes));
-    CUDA_CHECK(cudaFree(d_out));
-    CUDA_CHECK(cudaFree(d_mode));
-    CUDA_CHECK(cudaFree(d_bits));
-    CUDA_CHECK(cudaFree(d_sizes));
-    CUDA_CHECK(cudaFree(d_starts));
-    CUDA_CHECK(cudaFree(d_data));
-    
-    return c;
-}
-
-template<typename T>
-static void decompress_impl_fixed(const Compressed& c, T* h_out, size_t n, const Params& p) {
-    // std::cout << "[DEBUG] 开始解压缩，数据量: " << n << std::endl;
-    
-    if (n == 0) return;
-    const int numBlocks = (int)c.offsets.size();
-    assert((size_t)numBlocks == c.elem_counts.size());
-
-    // std::cout << "[DEBUG] 解压块数: " << numBlocks << std::endl;
-    // std::cout << "[DEBUG] 压缩数据大小: " << c.data.size() << " bytes" << std::endl;
-
-    if (c.data.empty()) {
-        std::cout << "[ERROR] 压缩数据为空！" << std::endl;
-        return;
-    }
-
-    // 检查压缩数据
-    // std::cout << "[DEBUG] 压缩数据前10字节: ";
-    // for (int i = 0; i < 10 && i < c.data.size(); i++) {
-    //     printf("%02X ", c.data[i]);
-    // }
-    // std::cout << std::endl;
-
-    // 初始化输出
-    std::fill(h_out, h_out + n, T(-999.0));
-
-    uint8_t* d_bytes = nullptr; 
-    CUDA_CHECK(cudaMalloc(&d_bytes, c.data.size()));
-    CUDA_CHECK(cudaMemcpy(d_bytes, c.data.data(), c.data.size(), cudaMemcpyHostToDevice));
-
-    uint64_t *d_boff = nullptr, *d_bsiz = nullptr, *d_ost = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_boff, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_bsiz, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpy(d_boff, c.offsets.data(), numBlocks * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_bsiz, c.bit_sizes.data(), numBlocks * sizeof(uint64_t), cudaMemcpyHostToDevice));
-
-    std::vector<uint64_t> h_outStarts(numBlocks);
-    uint64_t acc = 0; 
-    for(int i = 0; i < numBlocks; i++) { 
-        h_outStarts[i] = acc; 
-        acc += c.elem_counts[i]; 
-    }
-    
-    if (acc != n) {
-        std::cout << "[ERROR] elem_counts总和(" << acc << ")不等于输出元素数(" << n << ")" << std::endl;
-        return;
-    }
-
-    CUDA_CHECK(cudaMalloc(&d_ost, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpy(d_ost, h_outStarts.data(), numBlocks * sizeof(uint64_t), cudaMemcpyHostToDevice));
-
-    T* d_out = nullptr; 
-    CUDA_CHECK(cudaMalloc(&d_out, n * sizeof(T)));
-    CUDA_CHECK(cudaMemset(d_out, 0, n * sizeof(T)));
-
-    dim3 gs(numBlocks), bs(1);
-    kernel_decompress_debug<T><<<gs, bs>>>(
-        d_bytes, d_boff, d_bsiz, d_ost, p.vectorSize, d_out, numBlocks
-    );
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    CUDA_CHECK(cudaMemcpy(h_out, d_out, n * sizeof(T), cudaMemcpyDeviceToHost));
-
-    // 检查输出结果
-    bool all_negative999 = true;
-    bool all_zero = true;
-    for (size_t i = 0; i < std::min(size_t(10), n); i++) {
-        if (h_out[i] != T(-999.0)) all_negative999 = false;
-        if (h_out[i] != T(0.0)) all_zero = false;
-    }
-    
-    if (all_negative999) {
-        std::cout << "[ERROR] 输出仍为初始值-999，解压失败！" << std::endl;
-    } else if (all_zero) {
-        std::cout << "[WARNING] 输出全为0！" << std::endl;
-    // } else {
-    //     std::cout << "[DEBUG] 输出前几个值: ";
-    //     for (size_t i = 0; i < std::min(size_t(5), n); i++) {
-    //         std::cout << h_out[i] << " ";
-    //     }
-    //     std::cout << std::endl;
-    }
-
-    CUDA_CHECK(cudaFree(d_out));
-    CUDA_CHECK(cudaFree(d_ost));
-    CUDA_CHECK(cudaFree(d_bsiz));
-    CUDA_CHECK(cudaFree(d_boff));
-    CUDA_CHECK(cudaFree(d_bytes));
-}
-
-// 显式实例化API
-Compressed compress_double(const double* data, size_t n, const Params& p) { 
-    return compress_impl_optimized<double>(data, n, p); 
-}
-Compressed compress_float(const float* data, size_t n, const Params& p) { 
-    return compress_impl_optimized<float>(data, n, p); 
-}
-void decompress_double(const Compressed& c, double* out, size_t n, const Params& p) { 
-    decompress_impl_fixed<double>(c, out, n, p); 
-}
-void decompress_float(const Compressed& c, float* out, size_t n, const Params& p) { 
-    decompress_impl_fixed<float>(c, out, n, p); 
-}
-
-
-// 设备端压缩实现
-template<typename T>
-static CompressedDevice compress_device_impl(const T* d_data, size_t n, const Params& p, cudaStream_t stream) {
+static CompressedDevice compress_core_device(const T* d_data, size_t n, const Params& p, cudaStream_t stream) {
     CompressedDevice c;
-    if (n == 0) { c.vectorSize = p.vectorSize; return c; }
+    if (n == 0) { 
+        c.vectorSize = p.vectorSize; 
+        return c; 
+    }
     
     const int V = p.vectorSize;
     const int B = p.blockSize > 0 ? p.blockSize : int(n);
     const int numBlocks = int((n + B - 1) / B);
     
-    // 计算总向量数和块信息
+    // 计算块信息
     uint64_t total_vectors = 0;
     std::vector<uint64_t> h_starts(numBlocks), h_sizes(numBlocks);
     size_t pos = 0;
@@ -1336,67 +2254,121 @@ static CompressedDevice compress_device_impl(const T* d_data, size_t n, const Pa
         pos += sz;
     }
     
-    // 上传块信息到GPU（使用异步传输）
+    // 拷贝块信息到设备
     uint64_t *d_starts = nullptr, *d_sizes = nullptr;
     CUDA_CHECK(cudaMalloc(&d_starts, numBlocks * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_sizes, numBlocks * sizeof(uint64_t)));
     CUDA_CHECK(cudaMemcpyAsync(d_starts, h_starts.data(), numBlocks * sizeof(uint64_t), 
-                               cudaMemcpyHostToDevice, stream));
+                              cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_sizes, h_sizes.data(), numBlocks * sizeof(uint64_t), 
-                               cudaMemcpyHostToDevice, stream));
+                              cudaMemcpyHostToDevice, stream));
     
-    // 第一阶段：并行测量
-    uint64_t* d_bits = nullptr;
-    uint8_t* d_mode = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_bits, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_mode, numBlocks * sizeof(uint8_t)));
+    // ==================== 阶段1：采样（移除ALPrd预计算） ====================
+    uint8_t* d_modes = nullptr;
+    uint8_t* d_k_actual = nullptr;
+    uint8_t* d_k_combinations = nullptr;
     
-    dim3 grid1(numBlocks);
-    dim3 block1(THREADS_PER_BLOCK);
+    CUDA_CHECK(cudaMalloc(&d_modes, numBlocks));
+    CUDA_CHECK(cudaMalloc(&d_k_actual, numBlocks));
+    CUDA_CHECK(cudaMalloc(&d_k_combinations, numBlocks * 5 * 2)); // [blocks][5 combinations][e,f]
     
-    kernel_measure_parallel<T><<<grid1, block1, 0, stream>>>(
+    dim3 sampling_grid(numBlocks);
+    dim3 sampling_block(32); // 每个rowgroup用少量线程
+    
+    kernel_rowgroup_sampling<T><<<sampling_grid, sampling_block, 0, stream>>>(
         d_data, d_starts, d_sizes, numBlocks, V,
-        d_bits, d_mode
+        d_modes, d_k_actual, d_k_combinations
     );
     
-    // 只拷贝必要的元数据回主机
-    std::vector<uint64_t> h_bits(numBlocks);
-    std::vector<uint8_t> h_mode(numBlocks);
-    CUDA_CHECK(cudaMemcpyAsync(h_bits.data(), d_bits, numBlocks * sizeof(uint64_t), 
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(h_mode.data(), d_mode, numBlocks * sizeof(uint8_t), 
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream)); // 需要元数据来计算偏移
+    // ============== 记录rowgroup采样结果 ==============
+    if (p.enable_recording && get_gpu_recording_enabled()) {
+        // 拷贝GPU结果到主机端进行记录
+        std::vector<uint8_t> h_modes(numBlocks);
+        std::vector<uint8_t> h_k_actual(numBlocks);
+        std::vector<uint8_t> h_k_combinations(numBlocks * 5 * 2);
+        
+        CUDA_CHECK(cudaMemcpyAsync(h_modes.data(), d_modes, numBlocks, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_k_actual.data(), d_k_actual, numBlocks, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_k_combinations.data(), d_k_combinations, numBlocks * 5 * 2, 
+                                  cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        
+        // 为每个rowgroup记录k组合
+        for(int blockId = 0; blockId < numBlocks; blockId++) {
+            if(h_modes[blockId] == 0) { // ALP模式
+                std::vector<std::pair<std::pair<int, int>, int>> combinations;
+                int k_count = h_k_actual[blockId];
+                for(int i = 0; i < k_count; i++) {
+                    int base_idx = blockId * 5 * 2 + i * 2;
+                    int e = h_k_combinations[base_idx];
+                    int f = h_k_combinations[base_idx + 1];
+                    combinations.push_back({{e, f}, 1}); // count设为1
+                }
+                record_gpu_rowgroup_combinations(combinations);
+            }
+        }
+    }
     
-    // 第二阶段：计算每个向量的元数据
-    uint64_t* d_vec_bit_sizes = nullptr;
+    // ==================== 阶段2：向量参数选择 ====================
     uint8_t* d_vec_e = nullptr;
     uint8_t* d_vec_f = nullptr;
     uint16_t* d_vec_bitw = nullptr;
     int64_t* d_vec_FOR = nullptr;
-    uint32_t* d_vec_exc_cnt = nullptr;
+    uint16_t* d_vec_exc_cnt = nullptr;
+    uint64_t* d_vec_bit_sizes = nullptr;
     
-    CUDA_CHECK(cudaMalloc(&d_vec_bit_sizes, total_vectors * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_vec_e, total_vectors * sizeof(uint8_t)));
-    CUDA_CHECK(cudaMalloc(&d_vec_f, total_vectors * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&d_vec_e, total_vectors));
+    CUDA_CHECK(cudaMalloc(&d_vec_f, total_vectors));
     CUDA_CHECK(cudaMalloc(&d_vec_bitw, total_vectors * sizeof(uint16_t)));
     CUDA_CHECK(cudaMalloc(&d_vec_FOR, total_vectors * sizeof(int64_t)));
-    CUDA_CHECK(cudaMalloc(&d_vec_exc_cnt, total_vectors * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_vec_exc_cnt, total_vectors * sizeof(uint16_t)));
+    CUDA_CHECK(cudaMalloc(&d_vec_bit_sizes, total_vectors * sizeof(uint64_t)));
     
-    kernel_compute_vector_metadata<T><<<grid1, block1, 0, stream>>>(
-        d_data, d_starts, d_sizes, d_mode,
-        numBlocks, V,
-        d_vec_bit_sizes, d_vec_e, d_vec_f,
-        d_vec_bitw, d_vec_FOR, d_vec_exc_cnt
+    dim3 param_grid(numBlocks);
+    dim3 param_block(THREADS_PER_BLOCK);
+    
+    kernel_vector_parameter_selection<T><<<param_grid, param_block, 0, stream>>>(
+        d_data, d_starts, d_sizes,
+        d_modes, d_k_actual, d_k_combinations,
+        numBlocks, V, total_vectors,
+        d_vec_e, d_vec_f, d_vec_bitw, d_vec_FOR, d_vec_exc_cnt, d_vec_bit_sizes
     );
     
-    // 拷贝向量位大小用于计算偏移
+    // ============== 记录向量(e,f)选择 ==============
+    if (p.enable_recording && get_gpu_recording_enabled()) {
+        // 拷贝向量参数到主机端
+        std::vector<uint8_t> h_vec_e(total_vectors);
+        std::vector<uint8_t> h_vec_f(total_vectors);
+        std::vector<uint8_t> h_modes_for_vectors(numBlocks);
+        
+        CUDA_CHECK(cudaMemcpyAsync(h_vec_e.data(), d_vec_e, total_vectors, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_vec_f.data(), d_vec_f, total_vectors, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_modes_for_vectors.data(), d_modes, numBlocks, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        
+        // 记录每个向量的(e,f)选择
+        uint64_t vec_idx = 0;
+        for(int blockId = 0; blockId < numBlocks; blockId++) {
+            int numVec = (h_sizes[blockId] + V - 1) / V;
+            for(int v = 0; v < numVec; v++) {
+                if(h_modes_for_vectors[blockId] == 0) { // ALP模式
+                    uint8_t e = h_vec_e[vec_idx];
+                    uint8_t f = h_vec_f[vec_idx];
+                    record_gpu_vector_ef(e, f);
+                }
+                // ALPrd模式的向量用0xFF标记，不记录
+                vec_idx++;
+            }
+        }
+    }
+    
+    // 拷贝bit_sizes用于计算偏移
     std::vector<uint64_t> h_vec_bit_sizes(total_vectors);
     CUDA_CHECK(cudaMemcpyAsync(h_vec_bit_sizes.data(), d_vec_bit_sizes, 
-                               total_vectors * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
+                              total_vectors * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     
-    // 第三阶段：计算位偏移
+    // ==================== 计算偏移量 ====================
     std::vector<uint64_t> h_block_offsets(numBlocks);
     std::vector<uint64_t> h_vec_offsets(total_vectors);
     
@@ -1405,7 +2377,7 @@ static CompressedDevice compress_device_impl(const T* d_data, size_t n, const Pa
     
     for(int b = 0; b < numBlocks; b++) {
         h_block_offsets[b] = block_offset;
-        uint64_t current_offset = block_offset + 8; // 行组头
+        uint64_t current_offset = block_offset + 8; // block header
         
         int numVec = (h_sizes[b] + V - 1) / V;
         for(int v = 0; v < numVec; v++) {
@@ -1414,51 +2386,47 @@ static CompressedDevice compress_device_impl(const T* d_data, size_t n, const Pa
             vec_idx++;
         }
         
+        // 块级padding
         uint64_t block_bits = current_offset - block_offset;
         uint64_t padding = (32 - (block_bits & 31)) & 31;
         block_offset = current_offset + padding;
     }
     
-    const uint64_t total_bits = block_offset;
-    const uint64_t total_bytes = (total_bits + 7) / 8;
+    const uint64_t total_bytes = (block_offset + 7) / 8;
     
-    // 上传向量偏移到GPU
-    uint64_t* d_vec_offsets = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_vec_offsets, total_vectors * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpyAsync(d_vec_offsets, h_vec_offsets.data(), 
-                              total_vectors * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
-    
-    // 第四阶段：分配设备端输出缓冲并写入
+    // ==================== 阶段3：压缩写入 ====================
     CUDA_CHECK(cudaMalloc(&c.d_data, total_bytes));
     CUDA_CHECK(cudaMemsetAsync(c.d_data, 0, total_bytes, stream));
     c.data_size = total_bytes;
     
-    // 写入行组头
+    // 拷贝偏移量到设备
+    uint64_t* d_vec_offsets = nullptr;
     uint64_t* d_block_offsets = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_vec_offsets, total_vectors * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_block_offsets, numBlocks * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMemcpyAsync(d_vec_offsets, h_vec_offsets.data(), 
+                              total_vectors * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_block_offsets, h_block_offsets.data(), 
-                               numBlocks * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+                              numBlocks * sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
     
-    int header_threads = std::min(numBlocks, 256);
-    int header_blocks = (numBlocks + header_threads - 1) / header_threads;
-    kernel_write_rowgroup_headers<<<header_blocks, header_threads, 0, stream>>>(
+    // 写入块头
+    kernel_write_rowgroup_headers<<<(numBlocks + 255) / 256, 256, 0, stream>>>(
         d_sizes, d_block_offsets, numBlocks, V, c.d_data
     );
     
-    // 并行写入所有向量
-    kernel_parallel_emit<T><<<grid1, block1, 0, stream>>>(
-        d_data, d_starts, d_sizes, d_mode,
-        d_vec_offsets, d_vec_e, d_vec_f,
-        d_vec_bitw, d_vec_FOR,
+    // 压缩写入数据
+    kernel_compress_and_write<T><<<param_grid, param_block, 0, stream>>>(
+        d_data, d_starts, d_sizes,
+        d_modes, d_vec_offsets, d_vec_e, d_vec_f, d_vec_bitw, d_vec_FOR,
         numBlocks, V, c.d_data
     );
     
-    // 填充元数据（保持在主机端）
+    // 设置元数据
     c.offsets = std::move(h_block_offsets);
     c.bit_sizes.resize(numBlocks);
     vec_idx = 0;
     for(int b = 0; b < numBlocks; b++) {
-        uint64_t block_bits = 8; // 行组头
+        uint64_t block_bits = 8; // header
         int numVec = (h_sizes[b] + V - 1) / V;
         for(int v = 0; v < numVec; v++) {
             block_bits += h_vec_bit_sizes[vec_idx++];
@@ -1468,62 +2436,201 @@ static CompressedDevice compress_device_impl(const T* d_data, size_t n, const Pa
     c.elem_counts.assign(h_sizes.begin(), h_sizes.end());
     c.vectorSize = V;
     
-    // 清理临时GPU内存
+    // ==================== 清理内存 ====================
     CUDA_CHECK(cudaFree(d_block_offsets));
     CUDA_CHECK(cudaFree(d_vec_offsets));
+    CUDA_CHECK(cudaFree(d_vec_bit_sizes));
     CUDA_CHECK(cudaFree(d_vec_exc_cnt));
     CUDA_CHECK(cudaFree(d_vec_FOR));
     CUDA_CHECK(cudaFree(d_vec_bitw));
     CUDA_CHECK(cudaFree(d_vec_f));
     CUDA_CHECK(cudaFree(d_vec_e));
-    CUDA_CHECK(cudaFree(d_vec_bit_sizes));
-    CUDA_CHECK(cudaFree(d_mode));
-    CUDA_CHECK(cudaFree(d_bits));
+    CUDA_CHECK(cudaFree(d_k_combinations));
+    CUDA_CHECK(cudaFree(d_k_actual));
+    CUDA_CHECK(cudaFree(d_modes));
     CUDA_CHECK(cudaFree(d_sizes));
     CUDA_CHECK(cudaFree(d_starts));
     
     return c;
 }
 
-// 设备端解压实现
+// ==================== 其余实现保持不变 ====================
+
 template<typename T>
-static void decompress_device_impl(const CompressedDevice& c, T* d_out, size_t n, const Params& p, cudaStream_t stream) {
-    if (n == 0) return;
-    const int numBlocks = (int)c.offsets.size();
-    
-    // 上传元数据到GPU
-    uint64_t *d_boff = nullptr, *d_bsiz = nullptr, *d_ost = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_boff, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMalloc(&d_bsiz, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpyAsync(d_boff, c.offsets.data(), numBlocks * sizeof(uint64_t), 
-                               cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(d_bsiz, c.bit_sizes.data(), numBlocks * sizeof(uint64_t), 
-                               cudaMemcpyHostToDevice, stream));
-    
-    std::vector<uint64_t> h_outStarts(numBlocks);
-    uint64_t acc = 0;
-    for(int i = 0; i < numBlocks; i++) {
-        h_outStarts[i] = acc;
-        acc += c.elem_counts[i];
+static Compressed compress_impl(const T* h_data, size_t n, const Params& p) {
+    if (n == 0) {
+        Compressed c;
+        c.vectorSize = p.vectorSize;
+        return c;
     }
     
-    CUDA_CHECK(cudaMalloc(&d_ost, numBlocks * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpyAsync(d_ost, h_outStarts.data(), numBlocks * sizeof(uint64_t), 
-                              cudaMemcpyHostToDevice, stream));
+    // 启用记录功能（如果参数中启用）
+    if (p.enable_recording) {
+        enable_gpu_alp_recording(true);
+    }
     
-    // 执行解压kernel
-    dim3 gs(numBlocks), bs(1);
-    kernel_decompress_debug<T><<<gs, bs, 0, stream>>>(
-        c.d_data, d_boff, d_bsiz, d_ost, p.vectorSize, d_out, numBlocks
-    );
+    // 分配设备内存并拷贝数据
+    T* d_data = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_data, n * sizeof(T)));
+    CUDA_CHECK(cudaMemcpy(d_data, h_data, n * sizeof(T), cudaMemcpyHostToDevice));
+    
+    // 调用核心设备端实现
+    CompressedDevice device_result = compress_core_device<T>(d_data, n, p, 0);
+    
+    // 转换为主机端格式
+    Compressed host_result = device_to_host(device_result);
     
     // 清理
-    CUDA_CHECK(cudaFree(d_ost));
-    CUDA_CHECK(cudaFree(d_bsiz));
-    CUDA_CHECK(cudaFree(d_boff));
+    CUDA_CHECK(cudaFree(d_data));
+    
+    return host_result;
 }
 
-// API实现
+template<typename T>
+static CompressedDevice compress_device_impl(const T* d_data, size_t n, const Params& p, cudaStream_t stream) {
+    // 启用记录功能（如果参数中启用）
+    if (p.enable_recording) {
+        enable_gpu_alp_recording(true);
+    }
+    
+    // 直接调用核心实现
+    return compress_core_device<T>(d_data, n, p, stream);
+}
+
+template<typename T>
+static void decompress_core_device(const uint8_t* d_compressed_data,
+                                  const std::vector<uint64_t>& offsets,
+                                  const std::vector<uint64_t>& bit_sizes,
+                                  const std::vector<uint32_t>& elem_counts,
+                                  int vectorSize,
+                                  T* d_output,
+                                  size_t output_size,
+                                  cudaStream_t stream) {
+    if (output_size == 0) return;
+    
+    const int numBlocks = (int)offsets.size();
+    if (numBlocks == 0) return;
+    
+    // 分配并拷贝元数据到设备
+    uint64_t *d_offsets = nullptr, *d_bit_sizes = nullptr, *d_output_starts = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_offsets, numBlocks * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_bit_sizes, numBlocks * sizeof(uint64_t)));
+    CUDA_CHECK(cudaMalloc(&d_output_starts, numBlocks * sizeof(uint64_t)));
+    
+    CUDA_CHECK(cudaMemcpyAsync(d_offsets, offsets.data(), numBlocks * sizeof(uint64_t), 
+                              cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_bit_sizes, bit_sizes.data(), numBlocks * sizeof(uint64_t), 
+                              cudaMemcpyHostToDevice, stream));
+    
+    // 计算输出起始位置
+    std::vector<uint64_t> output_starts(numBlocks);
+    uint64_t accumulated = 0;
+    for(int i = 0; i < numBlocks; i++) {
+        output_starts[i] = accumulated;
+        accumulated += elem_counts[i];
+    }
+    
+    CUDA_CHECK(cudaMemcpyAsync(d_output_starts, output_starts.data(), numBlocks * sizeof(uint64_t), 
+                              cudaMemcpyHostToDevice, stream));
+    
+    // 初始化输出数据（用于调试）
+    CUDA_CHECK(cudaMemsetAsync(d_output, 0, output_size * sizeof(T), stream));
+    
+    // 启动解压kernel
+    dim3 grid(numBlocks);
+    dim3 block(1); // 每个block用单线程处理一个压缩块
+    
+    kernel_decompress_debug<T><<<grid, block, 0, stream>>>(
+        d_compressed_data,
+        d_offsets,
+        d_bit_sizes, 
+        d_output_starts,
+        vectorSize,
+        d_output,
+        numBlocks
+    );
+    
+    // 清理设备内存
+    CUDA_CHECK(cudaFree(d_output_starts));
+    CUDA_CHECK(cudaFree(d_bit_sizes));
+    CUDA_CHECK(cudaFree(d_offsets));
+}
+
+// 主机端解压实现
+template<typename T>
+static void decompress_impl(const Compressed& compressed, 
+                              T* h_output, 
+                              size_t output_size, 
+                              const Params& params) {
+    if (output_size == 0 || compressed.empty()) return;
+    
+    // 分配设备内存
+    uint8_t* d_compressed_data = nullptr;
+    T* d_output = nullptr;
+    
+    CUDA_CHECK(cudaMalloc(&d_compressed_data, compressed.data.size()));
+    CUDA_CHECK(cudaMalloc(&d_output, output_size * sizeof(T)));
+    
+    // 拷贝压缩数据到设备
+    CUDA_CHECK(cudaMemcpy(d_compressed_data, compressed.data.data(), 
+                          compressed.data.size(), cudaMemcpyHostToDevice));
+    
+    // 调用核心解压实现
+    decompress_core_device<T>(
+        d_compressed_data,
+        compressed.offsets,
+        compressed.bit_sizes,
+        compressed.elem_counts,
+        compressed.vectorSize,
+        d_output,
+        output_size,
+        0  // 默认stream
+    );
+    
+    // 等待GPU完成并拷贝结果回主机
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h_output, d_output, output_size * sizeof(T), cudaMemcpyDeviceToHost));
+    
+    // 清理设备内存
+    CUDA_CHECK(cudaFree(d_output));
+    CUDA_CHECK(cudaFree(d_compressed_data));
+}
+
+// 设备端解压实现
+template<typename T>
+static void decompress_device_impl(const CompressedDevice& compressed_device, 
+                                        T* d_output, 
+                                        size_t output_size, 
+                                        const Params& params, 
+                                        cudaStream_t stream) {
+    // 直接调用核心实现，数据已在设备上
+    decompress_core_device<T>(
+        compressed_device.d_data,
+        compressed_device.offsets,
+        compressed_device.bit_sizes,
+        compressed_device.elem_counts,
+        compressed_device.vectorSize,
+        d_output,
+        output_size,
+        stream
+    );
+}
+
+// 主机端API
+Compressed compress_double(const double* data, size_t n, const Params& p) { 
+    return compress_impl<double>(data, n, p); 
+}
+Compressed compress_float(const float* data, size_t n, const Params& p) { 
+    return compress_impl<float>(data, n, p); 
+}
+void decompress_double(const Compressed& c, double* out, size_t n, const Params& p) { 
+    decompress_impl<double>(c, out, n, p); 
+}
+void decompress_float(const Compressed& c, float* out, size_t n, const Params& p) { 
+    decompress_impl<float>(c, out, n, p); 
+}
+
+// 设备端API
 CompressedDevice compress_double_device(const double* d_data, size_t n, const Params& p, cudaStream_t stream) {
     return compress_device_impl<double>(d_data, n, p, stream);
 }
@@ -1540,7 +2647,7 @@ void decompress_float_device(const CompressedDevice& c, float* d_out, size_t n, 
     decompress_device_impl<float>(c, d_out, n, p, stream);
 }
 
-// 辅助函数
+// 数据交互函数
 Compressed device_to_host(const CompressedDevice& cd) {
     Compressed c;
     c.data.resize(cd.data_size);

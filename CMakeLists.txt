@@ -17,12 +17,15 @@ set(CMAKE_CUDA_ARCHITECTURES 70)
 # 包含目录
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/ALP/include
+
     ${CUDA_INCLUDE_DIRS}
 )
 
 # 源文件
 set(ALP_GPU_SOURCES
     src/alp_gpu.cu
+    # src/alp_gpu_hybrid.cu
 )
 
 set(ALP_GPU_HEADERS
